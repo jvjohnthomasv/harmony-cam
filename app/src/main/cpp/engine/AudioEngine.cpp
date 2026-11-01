@@ -43,6 +43,7 @@ void AudioEngine::prepareDsp() {
     lead.setup((float) sampleRate, false, bank.pitchMarker());
     const int maxFrames = 8192;
     leadBuf.assign(maxFrames, 0.0f);
+    drainBuf.assign(maxFrames * 2, 0.0f);
     dry.assign(maxFrames, 0.0f); cond.assign(maxFrames, 0.0f);
     L.assign(maxFrames, 0.0f); R.assign(maxFrames, 0.0f);
     TL.assign(maxFrames, 0.0f); TR.assign(maxFrames, 0.0f);
@@ -163,6 +164,24 @@ oboe::DataCallbackResult AudioEngine::onBothStreamsReady(const void *inputData, 
                                                          void *outputData, int numOutputFrames) {
     const int n = std::min(numOutputFrames, (int) dry.size());
     const float *in = static_cast<const float *>(inputData);
+
+    // Latency guard: if input has piled up (clock drift between mic and output devices, or a
+    // CPU hiccup), drop the excess so what you hear never lags behind your voice.
+    if (inStream && ++drainCheck >= 8) {
+        drainCheck = 0;
+        auto avail = inStream->getAvailableFrames();
+        int burst = std::max(32, outStream ? outStream->getFramesPerBurst() : 192);
+        if (avail && avail.value() > numOutputFrames + 3 * burst) {
+            int excess = avail.value() - (numOutputFrames + burst);
+            while (excess > 0) {
+                int chunk = std::min(excess, (int) (drainBuf.size() / std::max(1, inChannels)));
+                auto r = inStream->read(drainBuf.data(), chunk, 0);
+                if (!r || r.value() <= 0) break;
+                excess -= r.value();
+            }
+            xruns.fetch_add(1);
+        }
+    }
     float *out = static_cast<float *>(outputData);
 
     const float gain = inputGain.load(std::memory_order_relaxed);

@@ -94,7 +94,8 @@ private:
     VoiceBank bank;
     MixBus bus;
     LeadProcessor lead;
-    std::vector<float> leadBuf;
+    std::vector<float> leadBuf, drainBuf;
+    int drainCheck = 0;
     std::vector<float> dry, cond, L, R, asrTmpF;
     std::vector<int16_t> asrTmp;
 

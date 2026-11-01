@@ -146,6 +146,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         if (view != null) {
             val tracker = handTracker ?: HandTracker(ctx) { d -> onHands(d) }.also { handTracker = it }
             tracker.enabled = settings.gestures || settings.handOverlay
+            camera.maxQuality = settings.maxVideoQuality
             camera.bind(owner, view, tracker, overlay)
         }
         meterJob = viewModelScope.launch { pollMeters() }
@@ -253,6 +254,10 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         pushControls()
         applyMonitor()
         if (s.inputGainDb != old.inputGainDb) NativeEngine.nSetInputGainDb(s.inputGainDb)
+        if (s.maxVideoQuality != old.maxVideoQuality && started && !recording) {
+            val o = owner; val v = previewView; val t = handTracker
+            if (o != null && v != null && t != null) { camera.maxQuality = s.maxVideoQuality; camera.bind(o, v, t, overlay) }
+        }
         if (s.inputChannel != old.inputChannel && started && !recording) {
             NativeEngine.nStop()
             startEngine(routing.current)
@@ -362,8 +367,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun onHands(d: HandTracker.Detection) {
         val s = settings
-        if (s.handOverlay) overlay.update(d)
         val g = interpreter.update(d.mirrored, s.swapHands, s.holdWhenLost, d.uptimeMs)
+        if (s.handOverlay) overlay.update(d, g.voiceIndex)
         if (s.gestures) {
             NativeEngine.nSetControl(NativeEngine.C_VOICES, effectiveVoices(g.voices).toFloat())
             NativeEngine.nSetControl(NativeEngine.C_HEIGHT, g.height)
@@ -395,10 +400,14 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         videoResult = done
         val started = camera.startRecording(
             File(dir, "video.mp4"),
-            onStarted = {
-                val fallback = System.nanoTime()
-                overlay.armFirstFrame { ns -> videoStartNs = ns }
-                viewModelScope.launch { delay(400); if (videoStartNs == 0L) videoStartNs = fallback }
+            onStarted = { startNs ->
+                // the first recorded frame is the first camera frame at/after the encoder start
+                videoStartNs = startNs
+                viewModelScope.launch(Dispatchers.Default) {
+                    delay(300)
+                    val f = overlay.firstFrameAtOrAfter(startNs - 2_000_000L)
+                    if (f != 0L && f - startNs < 200_000_000L) videoStartNs = f
+                }
             },
             onFinished = { file, err ->
                 if (err != null) Log.w("Studio", err)

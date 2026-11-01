@@ -21,7 +21,7 @@ import kotlin.random.Random
 /**
  * Draws the reel-style hand overlay into the camera frames (preview AND recorded video):
  * MediaPipe-style green bones + red joints on every hand, and a glowing swirl orb with a sparkle
- * stream at the thumb tip of the raised (voice) hand.
+ * stream at the index fingertip of the voice hand.
  *
  * Landmarks are smoothed with a One-Euro filter and extrapolated to each frame's timestamp, so the
  * skeleton stays glued to the hand despite detection running a frame or two behind the camera.
@@ -35,42 +35,73 @@ class HandOverlay {
     /** 0..1 effect intensity → sparkle density. */
     @Volatile var intensity = 0.4f
 
-    /** Called once with the camera timestamp (ns, converted to System.nanoTime base) of the first frame after [armFirstFrame]. */
-    @Volatile private var firstFrameCallback: ((Long) -> Unit)? = null
-    fun armFirstFrame(cb: (Long) -> Unit) { firstFrameCallback = cb }
+    // ── timestamps (System.nanoTime base) of the frames that went to the video encoder
+    private val frameTimes = LongArray(256)
+    private var frameCount = 0
+    /**
+     * CameraX's encoder records exactly the frames whose timestamp is >= its start time; this
+     * returns the first drawn frame at/after [startNs] (System.nanoTime base), or 0 if unknown.
+     */
+    fun firstFrameAtOrAfter(startNs: Long): Long = synchronized(frameTimes) {
+        val n = min(frameCount, frameTimes.size)
+        var best = 0L
+        for (k in 0 until n) {
+            val t = frameTimes[(frameCount - 1 - k) % frameTimes.size]
+            if (t >= startNs && (best == 0L || t < best)) best = t
+        }
+        best
+    }
 
     // ── latest detection (written by the analysis thread)
     @Volatile private var detection: HandTracker.Detection? = null
-    fun update(d: HandTracker.Detection) { detection = d; filterHands(d) }
+    /** voiceIndex: which detected hand is the voice hand (from the gesture interpreter). */
+    fun update(d: HandTracker.Detection, voiceIndex: Int) { detection = d; filterHands(d, voiceIndex) }
 
     private val lock = Any()
-    private val filters = Array(2) { Array(42) { OneEuro(1.6, 0.4, 1.0) } }
+    private val filters = Array(2) { Array(42) { OneEuro(2.5, 1.2, 1.0) } }
     private var filteredHands: List<FloatArray> = emptyList()   // upright normalised, filtered
     private var velocities: List<FloatArray> = emptyList()
     private var filteredTs = 0L
     private var voiceIndex = -1
 
-    private fun filterHands(d: HandTracker.Detection) {
+    private val slotPalm = Array(2) { floatArrayOf(-1f, -1f) }
+
+    private fun filterHands(d: HandTracker.Detection, voiceIdx: Int) {
         synchronized(lock) {
             val t = d.cameraTimestampNs / 1e9
-            // keep hand identity stable by ordering hands left→right
-            val hands = d.upright.sortedBy { centerX(it) }
+            val hands = d.upright.take(2)
+            // assign each detected hand to the filter slot whose last palm is nearest (stable identity)
+            val slotOf = IntArray(hands.size) { -1 }
+            val taken = BooleanArray(2)
+            for ((i, h) in hands.withIndex()) {
+                val cx = centerX(h); val cy = palmY(h)
+                var best = -1; var bestD = Float.MAX_VALUE
+                for (sl in 0 until 2) {
+                    if (taken[sl]) continue
+                    val p = slotPalm[sl]
+                    val dd = if (p[0] < 0) 10f else (p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy)
+                    if (dd < bestD) { bestD = dd; best = sl }
+                }
+                if (bestD > 0.09f) filters[best].forEach { it.reset() } // a different hand: don't smear between them
+                taken[best] = true; slotOf[i] = best
+                slotPalm[best][0] = cx; slotPalm[best][1] = cy
+            }
+            for (sl in 0 until 2) if (!taken[sl]) { slotPalm[sl][0] = -1f; filters[sl].forEach { it.reset() } }
             val outs = ArrayList<FloatArray>(hands.size)
             val vels = ArrayList<FloatArray>(hands.size)
-            for ((h, src) in hands.withIndex().take(2)) {
+            for ((i, src) in hands.withIndex()) {
+                val f = filters[slotOf[i]]
                 val o = FloatArray(42); val v = FloatArray(42)
-                for (i in 0 until 42) {
-                    o[i] = filters[h][i].filter(src[i].toDouble(), t).toFloat()
-                    v[i] = filters[h][i].velocity.toFloat()
+                for (k in 0 until 42) {
+                    o[k] = f[k].filter(src[k].toDouble(), t).toFloat()
+                    v[k] = f[k].velocity.toFloat()
                 }
                 outs.add(o); vels.add(v)
             }
-            if (hands.size < (filteredHands.size)) for (h in hands.size until 2) filters[h].forEach { it.reset() }
             filteredHands = outs
             velocities = vels
             filteredTs = d.cameraTimestampNs
-            // the raised hand (highest palm) is the voice hand → gets the orb
-            voiceIndex = outs.indices.minByOrNull { palmY(outs[it]) } ?: -1
+            voiceIndex = if (voiceIdx in outs.indices) voiceIdx else -1
         }
     }
 
@@ -78,7 +109,13 @@ class HandOverlay {
     private val bone = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(0, 230, 0); style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
     private val joint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(235, 0, 0); style = Paint.Style.FILL }
     private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-    private val glow = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val glowShader = RadialGradient(
+        0f, 0f, 1f,
+        intArrayOf(Color.argb(220, 255, 255, 255), Color.argb(150, 190, 245, 255), Color.argb(60, 140, 220, 255), Color.argb(0, 120, 200, 255)),
+        floatArrayOf(0f, 0.35f, 0.65f, 1f), Shader.TileMode.CLAMP
+    )
+    private val glowMatrix = Matrix()
+    private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply { shader = glowShader }
     private val spark = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
     private class Particle(var x: Float, var y: Float, var vx: Float, var vy: Float, var age: Float, val life: Float, val size: Float)
@@ -86,9 +123,9 @@ class HandOverlay {
     private val rnd = Random(3)
     private var lastFrameNs = 0L
     private var emitCarry = 0f
-    private val swirl = FloatArray(48) { rnd.nextFloat() * 6.283f }
-    private val swirlR = FloatArray(48) { 0.85f + 0.8f * rnd.nextFloat() }
-    private val swirlS = FloatArray(48) { 1.5f + 3.5f * rnd.nextFloat() }
+    private val swirl = FloatArray(36) { rnd.nextFloat() * 6.283f }
+    private val swirlR = FloatArray(36) { 0.85f + 0.8f * rnd.nextFloat() }
+    private val swirlS = FloatArray(36) { 1.5f + 3.5f * rnd.nextFloat() }
     private var clockOffset: Long? = null
 
     private val pts = FloatArray(42)
@@ -104,7 +141,7 @@ class HandOverlay {
         val canvas = frame.overlayCanvas
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         val frameNs = frame.timestampNanos
-        firstFrameCallback?.let { cb -> firstFrameCallback = null; cb(toNanoTime(frameNs)) }
+        synchronized(frameTimes) { frameTimes[frameCount % frameTimes.size] = toNanoTime(frameNs); frameCount++ }
         if (!enabled) return true
 
         val dt = if (lastFrameNs == 0L) 1f / 30f else ((frameNs - lastFrameNs) / 1e9f).coerceIn(0f, 0.1f)
@@ -117,11 +154,11 @@ class HandOverlay {
         synchronized(lock) { hands = filteredHands; vels = velocities; ts = filteredTs; vIdx = voiceIndex }
         // hide stale hands (> 250 ms without detection)
         if (abs(frameNs - ts) > 250_000_000L) { stepParticles(dt, null, size); drawParticles(canvas, size); return true }
-        val lead = ((frameNs - ts) / 1e9f).coerceIn(0f, 0.08f)
+        val lead = ((frameNs - ts) / 1e9f).coerceIn(0f, 0.12f)
 
         bone.strokeWidth = size * 0.0042f
         val jointR = size * 0.0062f
-        var thumb: FloatArray? = null
+        var tip: FloatArray? = null
         for ((h, hand) in hands.withIndex()) {
             val v = vels.getOrNull(h)
             for (i in 0 until 21) {
@@ -133,24 +170,24 @@ class HandOverlay {
             for ((a, b) in CONNECTIONS) canvas.drawLine(pts[2 * a], pts[2 * a + 1], pts[2 * b], pts[2 * b + 1], bone)
             for (i in 0 until 21) canvas.drawCircle(pts[2 * i], pts[2 * i + 1], jointR, joint)
             if (h == vIdx) {
-                thumb = floatArrayOf(pts[8], pts[9])
-                // on-screen directions at the thumb, expressed in buffer pixels:
+                tip = floatArrayOf(pts[16], pts[17])   // index fingertip (landmark 8)
+                // on-screen directions at the fingertip, expressed in buffer pixels:
                 // "towards the middle of the frame" (where the reel's sparkle stream flows) and "up"
-                val tx = hand[8] + (v?.get(8) ?: 0f) * lead
-                val ty = hand[9] + (v?.get(9) ?: 0f) * lead
+                val tx = hand[16] + (v?.get(16) ?: 0f) * lead
+                val ty = hand[17] + (v?.get(17) ?: 0f) * lead
                 val toward = if (tx > 0.5f) -0.1f else 0.1f
                 val d = FloatArray(4)
                 det.mapping.toSensor(tx + toward, ty, d, 0)
                 det.mapping.toSensor(tx, ty - 0.1f, d, 2)
                 m.mapPoints(d)
-                streamDir[0] = d[0] - pts[8]; streamDir[1] = d[1] - pts[9]
-                upDir[0] = d[2] - pts[8]; upDir[1] = d[3] - pts[9]
+                streamDir[0] = d[0] - pts[16]; streamDir[1] = d[1] - pts[17]
+                upDir[0] = d[2] - pts[16]; upDir[1] = d[3] - pts[17]
                 normalize(streamDir); normalize(upDir)
             }
         }
 
-        stepParticles(dt, if (orbEnabled) thumb else null, size)
-        if (orbEnabled && thumb != null) drawOrb(canvas, thumb[0], thumb[1], size, frameNs / 1e9f)
+        stepParticles(dt, if (orbEnabled) tip else null, size)
+        if (orbEnabled && tip != null) drawOrb(canvas, tip[0], tip[1], size, frameNs / 1e9f)
         drawParticles(canvas, size)
         return true
     }
@@ -158,11 +195,9 @@ class HandOverlay {
     private fun drawOrb(canvas: android.graphics.Canvas, x: Float, y: Float, size: Float, t: Float) {
         val lv = level.coerceIn(0f, 1f)
         val r = size * (0.030f + 0.012f * lv)
-        glow.shader = RadialGradient(
-            x, y, r * 2.2f,
-            intArrayOf(Color.argb(220, 255, 255, 255), Color.argb(150, 190, 245, 255), Color.argb(60, 140, 220, 255), Color.argb(0, 120, 200, 255)),
-            floatArrayOf(0f, 0.35f, 0.65f, 1f), Shader.TileMode.CLAMP
-        )
+        glowMatrix.setScale(r * 2.2f, r * 2.2f)
+        glowMatrix.postTranslate(x, y)
+        glowShader.setLocalMatrix(glowMatrix)
         canvas.drawCircle(x, y, r * 2.2f, glow)
         ring.color = Color.argb(235, 255, 255, 255); ring.strokeWidth = r * 0.22f
         canvas.drawCircle(x, y, r, ring)
@@ -179,7 +214,7 @@ class HandOverlay {
 
     private fun stepParticles(dt: Float, emitter: FloatArray?, size: Float) {
         if (emitter != null) {
-            val rate = 140f + 260f * intensity.coerceIn(0f, 1f) + 120f * level
+            val rate = 110f + 170f * intensity.coerceIn(0f, 1f) + 90f * level
             emitCarry += rate * dt
             while (emitCarry >= 1f) {
                 emitCarry -= 1f
@@ -210,7 +245,7 @@ class HandOverlay {
             p.vy = p.vy * drag + upDir[1] * size * 0.02f * dt
             p.x += p.vx * dt; p.y += p.vy * dt
         }
-        if (particles.size > 1600) particles.subList(0, particles.size - 1600).clear()
+        if (particles.size > 700) particles.subList(0, particles.size - 700).clear()
     }
 
     private fun drawParticles(canvas: android.graphics.Canvas, size: Float) {

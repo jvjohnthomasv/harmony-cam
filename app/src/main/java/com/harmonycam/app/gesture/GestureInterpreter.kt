@@ -5,14 +5,17 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Turns raw hand landmarks into harmony controls.
+ * Turns raw hand landmarks into harmony controls — instantly (no frame-counting delays);
+ * stability comes from per-finger hysteresis instead.
  *
- * Voice hand (the raised / higher hand, or the only hand):
- *   - raised fingers (index..pinky) = number of harmony voices (1–4)
- *   - hand height = harmony layout (low → below the melody, high → above)
+ * Voice hand = the hand you gesture with. It is *tracked*: once a hand has shown open fingers it
+ * stays the voice hand (at any height) until it leaves the frame, so closing it into a fist mutes
+ * immediately. A hand that has never opened (e.g. the one holding the mic) never steers anything.
+ *   - raised fingers (index..pinky) = number of harmony voices (1–4; open palm = full chord)
+ *   - hand height = voicing (low → below the melody, high → above)
  *   - closed fist = harmonies muted
- * FX hand (the other, lower hand — a low fist holding the mic is ignored):
- *   - thumb–index spread = reverb / visual intensity (pinched = dry, spread = huge)
+ * FX hand (the other hand, if it has also opened):
+ *   - thumb–index spread = reverb / effect intensity
  *
  * Landmarks are 21 points × (x, y), normalised 0..1 in the upright, mirrored (selfie) image.
  */
@@ -27,76 +30,117 @@ class GestureInterpreter {
         val fxHand: FloatArray? = null,
         val extended: BooleanArray = BooleanArray(4),
         val pinch: Float = 0f,
+        /** index of the voice hand in the input list (-1 = none). */
+        val voiceIndex: Int = -1,
     )
 
+    private class Track(var x: Float, var y: Float, var lastSeenMs: Long, var opened: Boolean, val ext: BooleanArray = BooleanArray(4))
+
     private var voices = 2
-    private var candidateVoices = 2
-    private var candidateFrames = 0
     private var mute = false
-    private var muteFrames = 0
     private var height = 0.5f
     private var fx = 0.3f
     private var hasHeight = false
-    private var lastVoiceSeenMs = 0L
+    private var voiceTrack: Track? = null
+    private var fxTrack: Track? = null
+    private val candidates = ArrayList<Track>()
 
     fun reset(defaultVoices: Int, defaultHeight: Float) {
-        voices = defaultVoices; candidateVoices = defaultVoices; candidateFrames = 0
-        height = defaultHeight; hasHeight = false; mute = false; muteFrames = 0
+        voices = defaultVoices; height = defaultHeight; hasHeight = false; mute = false
+        voiceTrack = null; fxTrack = null; candidates.clear()
     }
 
     /**
-     * @param hands landmark arrays (42 floats each)
-     * @param swapHands treat the left-side hand as the voice hand
+     * @param hands landmark arrays (42 floats each), mirrored selfie coordinates
+     * @param swapHands prefer the lower open hand as the voice hand
      * @param holdWhenLost keep the last harmony state when the voice hand leaves the frame
      */
     fun update(hands: List<FloatArray>, swapHands: Boolean, holdWhenLost: Boolean, nowMs: Long): State {
-        var voiceHand: FloatArray? = null
-        var fxHand: FloatArray? = null
-        // A low, closed hand is almost always the one holding the mic: never let it mute/steer.
-        val usable = hands.take(2).filter { !(palmCenter(it).second > LOW_HAND_Y && isFist(it) && fingerCount(it) == 0) }
-        when (usable.size) {
-            0 -> {}
-            1 -> voiceHand = usable[0]
-            else -> {
-                // the raised (higher) hand plays the harmonies, the other one is the FX hand
-                val sorted = usable.sortedBy { palmCenter(it).second }
-                if (swapHands) { voiceHand = sorted[1]; fxHand = sorted[0] } else { voiceHand = sorted[0]; fxHand = sorted[1] }
+        val list = hands.take(2)
+        val centers = list.map { palmCenter(it) }
+
+        // ── match detections to known tracks (nearest palm centre)
+        val used = BooleanArray(list.size)
+        fun match(t: Track?, radius: Float): Int {
+            if (t == null) return -1
+            var best = -1; var bestD = radius
+            for (i in list.indices) {
+                if (used[i]) continue
+                val d = hypot(centers[i].first - t.x, centers[i].second - t.y)
+                if (d < bestD) { bestD = d; best = i }
             }
+            if (best >= 0) {
+                used[best] = true
+                t.x = centers[best].first; t.y = centers[best].second; t.lastSeenMs = nowMs
+            }
+            return best
+        }
+        // allowed jump grows with the time since the hand was last seen (fast gestures ≈ 3–4 frame-widths/s)
+        fun reach(t: Track?) = if (t == null) MATCH_RADIUS else min(0.45f, 0.10f + 2.5f * ((nowMs - t.lastSeenMs).coerceAtLeast(0) / 1000f))
+        var vIdx = match(voiceTrack, reach(voiceTrack))
+        if (vIdx < 0 && voiceTrack != null && nowMs - voiceTrack!!.lastSeenMs > LOST_MS) voiceTrack = null
+        var fIdx = match(fxTrack, reach(fxTrack))
+        if (fIdx < 0 && fxTrack != null && nowMs - fxTrack!!.lastSeenMs > LOST_MS) fxTrack = null
+
+        // ── unmatched hands: track them; a hand becomes eligible once it shows an open finger
+        val newOpen = ArrayList<Int>()
+        for (i in list.indices) {
+            if (used[i]) continue
+            var cand = candidates.minByOrNull { hypot(it.x - centers[i].first, it.y - centers[i].second) }
+            if (cand == null || hypot(cand.x - centers[i].first, cand.y - centers[i].second) > MATCH_RADIUS) {
+                cand = Track(centers[i].first, centers[i].second, nowMs, false).also { candidates.add(it) }
+            }
+            cand.x = centers[i].first; cand.y = centers[i].second; cand.lastSeenMs = nowMs
+            updateFingers(list[i], cand.ext)
+            if (cand.ext.any { it }) cand.opened = true
+            if (cand.opened) newOpen.add(i)
+        }
+        candidates.removeAll { nowMs - it.lastSeenMs > LOST_MS }
+
+        // ── promote open hands to voice / fx roles
+        // (a voice hand that wasn't found this frame is replaced by any newly opened hand —
+        //  e.g. the hand left the frame and came back somewhere else)
+        if ((voiceTrack == null || vIdx < 0) && newOpen.isNotEmpty()) {
+            val pick = if (swapHands) newOpen.maxByOrNull { centers[it].second }!! else newOpen.minByOrNull { centers[it].second }!!
+            voiceTrack = candidates.first { it.x == centers[pick].first && it.y == centers[pick].second }
+            candidates.remove(voiceTrack)
+            vIdx = pick
+            newOpen.remove(pick)
+        }
+        if (fxTrack == null && newOpen.isNotEmpty()) {
+            val pick = newOpen.first()
+            fxTrack = candidates.first { it.x == centers[pick].first && it.y == centers[pick].second }
+            candidates.remove(fxTrack)
+            fIdx = pick
         }
 
-        val ext = BooleanArray(4)
-        var pinchAmount = 0f
-        if (voiceHand != null) {
-            lastVoiceSeenMs = nowMs
-            for (f in 0 until 4) ext[f] = isFingerExtended(voiceHand, f)
-            val count = ext.count { it }
-            val fist = count == 0 && isFist(voiceHand)
-
-            // debounce mute so a quick finger change doesn't cut the harmonies
-            if (fist) muteFrames++ else muteFrames = 0
-            if (muteFrames >= 2) mute = true
-            if (!fist && count > 0) mute = false
-
-            if (count > 0) {
-                if (count == candidateVoices) candidateFrames++ else { candidateVoices = count; candidateFrames = 1 }
-                if (candidateFrames >= 2) voices = candidateVoices
-            }
-
-            // height: palm centre, active band 0.15..0.85 of the frame
-            val (_, cy) = palmCenter(voiceHand)
-            val target = ((0.85f - cy) / 0.70f).coerceIn(0f, 1f)
-            height = if (!hasHeight) target else height + (target - height) * 0.35f
+        // ── voice hand → voices / height / mute (applied immediately)
+        val vt = voiceTrack
+        var voiceHand: FloatArray? = null
+        if (vt != null && vIdx >= 0) {
+            val h = list[vIdx]
+            voiceHand = h
+            updateFingers(h, vt.ext)
+            val count = vt.ext.count { it }
+            if (count == 0 && isFist(h)) mute = true
+            else if (count > 0) { mute = false; voices = count }
+            val target = ((0.85f - centers[vIdx].second) / 0.70f).coerceIn(0f, 1f)
+            height = if (!hasHeight) target else height + (target - height) * 0.6f
             hasHeight = true
-        } else if (!holdWhenLost && nowMs - lastVoiceSeenMs > 600) {
+        } else if (vt == null && !holdWhenLost) {
             mute = true
         }
 
-        if (fxHand != null) {
-            val size = palmSize(fxHand)
-            val d = dist(fxHand, THUMB_TIP, INDEX_TIP) / max(size, 1e-4f)
+        // ── fx hand → pinch spread
+        var fxHand: FloatArray? = null
+        var pinchAmount = 0f
+        if (fxTrack != null && fIdx >= 0) {
+            val h = list[fIdx]
+            fxHand = h
+            val d = dist(h, THUMB_TIP, INDEX_TIP) / max(palmSize(h), 1e-4f)
             pinchAmount = d
             val target = ((d - 0.25f) / (1.25f - 0.25f)).coerceIn(0f, 1f)
-            fx += (target - fx) * 0.3f
+            fx += (target - fx) * 0.5f
         }
 
         return State(
@@ -106,17 +150,26 @@ class GestureInterpreter {
             fx = fx,
             voiceHand = voiceHand,
             fxHand = fxHand,
-            extended = ext,
+            extended = vt?.ext?.copyOf() ?: BooleanArray(4),
             pinch = pinchAmount,
+            voiceIndex = if (voiceHand != null) vIdx else -1,
         )
+    }
+
+    /** Per-finger hysteresis: a finger must clearly straighten to count, and clearly curl to stop counting. */
+    private fun updateFingers(h: FloatArray, ext: BooleanArray) {
+        for (f in 0 until 4) {
+            val (ratio, cos) = fingerShape(h, f)
+            ext[f] = if (ext[f]) !(ratio < 1.04f || cos < 0.30f) else (ratio > 1.14f && cos > 0.60f)
+        }
     }
 
     companion object {
         const val WRIST = 0
-        const val LOW_HAND_Y = 0.62f
-        fun fingerCount(h: FloatArray): Int = (0 until 4).count { isFingerExtended(h, it) }
         const val THUMB_TIP = 4
         const val INDEX_TIP = 8
+        private const val MATCH_RADIUS = 0.28f
+        private const val LOST_MS = 700L
         private val MCP = intArrayOf(5, 9, 13, 17)
         private val PIP = intArrayOf(6, 10, 14, 18)
         private val TIP = intArrayOf(8, 12, 16, 20)
@@ -134,24 +187,30 @@ class GestureInterpreter {
             return x / idx.size to y / idx.size
         }
 
-        /** Rotation-independent: tip is far from the wrist and the finger is roughly straight. */
-        fun isFingerExtended(h: FloatArray, finger: Int): Boolean {
+        /** (tip-to-wrist / pip-to-wrist ratio, straightness cosine) — rotation independent. */
+        fun fingerShape(h: FloatArray, finger: Int): Pair<Float, Float> {
             val mcp = MCP[finger]; val pip = PIP[finger]; val tip = TIP[finger]
-            val farther = dist(h, WRIST, tip) > dist(h, WRIST, pip) * 1.12f
+            val ratio = dist(h, WRIST, tip) / max(dist(h, WRIST, pip), 1e-5f)
             val ax = px(h, pip) - px(h, mcp); val ay = py(h, pip) - py(h, mcp)
             val bx = px(h, tip) - px(h, pip); val by = py(h, tip) - py(h, pip)
             val la = hypot(ax, ay); val lb = hypot(bx, by)
-            if (la < 1e-5f || lb < 1e-5f) return false
-            val cos = (ax * bx + ay * by) / (la * lb)
-            return farther && cos > 0.55f
+            val cos = if (la < 1e-5f || lb < 1e-5f) 0f else (ax * bx + ay * by) / (la * lb)
+            return ratio to cos
         }
+
+        fun isFingerExtended(h: FloatArray, finger: Int): Boolean {
+            val (ratio, cos) = fingerShape(h, finger)
+            return ratio > 1.12f && cos > 0.55f
+        }
+
+        fun fingerCount(h: FloatArray): Int = (0 until 4).count { isFingerExtended(h, it) }
 
         fun isFist(h: FloatArray): Boolean {
             val (cx, cy) = palmCenter(h)
             val size = palmSize(h)
             var sum = 0f
             for (t in TIP) sum += hypot(px(h, t) - cx, py(h, t) - cy)
-            return sum / TIP.size < size * 0.95f
+            return sum / TIP.size < size * 1.0f
         }
 
         fun clamp01(v: Float) = min(1f, max(0f, v))

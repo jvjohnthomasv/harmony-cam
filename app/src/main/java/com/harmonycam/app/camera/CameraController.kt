@@ -52,6 +52,8 @@ class CameraController(private val context: Context) {
     private var recording: Recording? = null
 
     var onZoomChanged: ((ZoomInfo) -> Unit)? = null
+    /** true: best quality the camera offers (4K if available); false: 1080p (lighter, smoother). */
+    @Volatile var maxQuality = true
     var videoQualityLabel: String = ""
         private set
 
@@ -61,8 +63,7 @@ class CameraController(private val context: Context) {
             val p = try { future.get() } catch (e: Exception) { Log.e(TAG, "provider", e); return@addListener }
             provider = p
             // try the best quality first; fall back if the device can't combine it with the overlay
-            val attempts = listOf(
-                listOf(Quality.UHD, Quality.FHD, Quality.HD),
+            val attempts = (if (maxQuality) listOf(listOf(Quality.UHD, Quality.FHD, Quality.HD)) else emptyList()) + listOf(
                 listOf(Quality.FHD, Quality.HD),
                 listOf(Quality.HD, Quality.SD),
             )
@@ -152,17 +153,19 @@ class CameraController(private val context: Context) {
 
     /** Starts a video-only recording (audio is produced by the harmony engine). */
     @SuppressLint("MissingPermission")
-    fun startRecording(file: File, onStarted: () -> Unit, onFinished: (File?, String?) -> Unit): Boolean {
+    fun startRecording(file: File, onStarted: (startNs: Long) -> Unit, onFinished: (File?, String?) -> Unit): Boolean {
         val vc = videoCapture ?: return false
         recording?.stop()
         val options = FileOutputOptions.Builder(file).build()
+        // Events are delivered directly on CameraX's recorder thread: the Start event fires right
+        // after the encoder's start time is taken, so System.nanoTime() here is within ~1 ms of it.
         recording = vc.output.prepareRecording(context, options)
-            .start(ContextCompat.getMainExecutor(context)) { event ->
+            .start({ r -> r.run() }) { event ->
                 when (event) {
-                    is VideoRecordEvent.Start -> onStarted()
+                    is VideoRecordEvent.Start -> onStarted(System.nanoTime())
                     is VideoRecordEvent.Finalize -> {
                         recording = null
-                        if (event.hasError() && event.error != VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) {
+                        if (event.hasError() && event.error != VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE && event.error != VideoRecordEvent.Finalize.ERROR_NONE) {
                             onFinished(if (file.exists() && file.length() > 0) file else null, "video error ${event.error}")
                         } else onFinished(file, null)
                     }

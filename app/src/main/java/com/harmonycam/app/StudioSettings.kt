@@ -15,6 +15,7 @@ data class StudioSettings(
     val handOverlay: Boolean = true,
     val orb: Boolean = true,
     val monitorTuning: Boolean = false,
+    val maxVideoQuality: Boolean = true,   // 4K if the camera supports it; false = 1080p (lighter)
     val gestures: Boolean = true,
     val swapHands: Boolean = false,
     val holdWhenLost: Boolean = true,
@@ -60,6 +61,7 @@ data class StudioSettings(
                 handOverlay = p.getBoolean("handOverlay", d.handOverlay),
                 orb = p.getBoolean("orb", d.orb),
                 monitorTuning = p.getBoolean("monitorTuning", d.monitorTuning),
+                maxVideoQuality = p.getBoolean("maxVideoQuality", d.maxVideoQuality),
                 gestures = p.getBoolean("gestures", d.gestures),
                 swapHands = p.getBoolean("swapHands", d.swapHands),
                 holdWhenLost = p.getBoolean("holdWhenLost", d.holdWhenLost),
@@ -94,6 +96,7 @@ data class StudioSettings(
                 .putFloat("reverb", s.reverb).putFloat("width", s.width)
                 .putBoolean("chordStyle", s.chordStyle).putBoolean("handOverlay", s.handOverlay)
                 .putBoolean("orb", s.orb).putBoolean("monitorTuning", s.monitorTuning)
+                .putBoolean("maxVideoQuality", s.maxVideoQuality)
                 .putBoolean("gestures", s.gestures).putBoolean("swapHands", s.swapHands)
                 .putBoolean("holdWhenLost", s.holdWhenLost).putBoolean("showSkeleton", s.showSkeleton)
                 .putBoolean("speakerMonitor", s.speakerMonitor).putFloat("monitorLevel", s.monitorLevel)

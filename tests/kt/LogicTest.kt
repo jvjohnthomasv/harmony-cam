@@ -82,5 +82,20 @@ fun main() {
     check("raised hand + mic hand -> 4 voices, not muted", !st.mute && st.voices == 4)
     st = g.update(emptyList(), false, true, 2500)
     check("hand lost holds state", st.voices == 4 && !st.mute)
+    // instant response: every change applies on the very next detection frame
+    val g2 = GestureInterpreter()
+    var s2 = g2.update(listOf(hand(0.6f, 0.4f, booleanArrayOf(true, true, true, true))), false, true, 0)
+    check("open palm -> 4 voices on first frame", s2.voices == 4 && !s2.mute)
+    s2 = g2.update(listOf(hand(0.6f, 0.4f, booleanArrayOf(true, true, false, false))), false, true, 33)
+    check("2 fingers applied on the next frame (got ${s2.voices})", s2.voices == 2)
+    var tt = 66L
+    for (k in 1..5) { s2 = g2.update(listOf(hand(0.6f, 0.4f + 0.076f * k, booleanArrayOf(true, true, false, false))), false, true, tt); tt += 33 }
+    s2 = g2.update(listOf(hand(0.6f, 0.78f, booleanArrayOf(false, false, false, false))), false, true, tt); tt += 33
+    check("voice hand lowered into a fist mutes immediately (even low)", s2.mute)
+    for (k in 1..4) { s2 = g2.update(listOf(hand(0.62f, 0.78f - 0.07f * k, booleanArrayOf(false, false, false, false))), false, true, tt); tt += 33 }
+    s2 = g2.update(listOf(hand(0.62f, 0.5f, booleanArrayOf(true, false, false, false))), false, true, tt); tt += 33
+    check("opening one finger unmutes immediately", !s2.mute && s2.voices == 1)
+    s2 = g2.update(listOf(hand(0.3f, 0.85f, booleanArrayOf(false, false, false, false)), hand(0.62f, 0.5f, booleanArrayOf(true, true, true, false))), false, true, tt)
+    check("mic fist appearing beside voice hand changes nothing but finger count (v=${s2.voices}, idx=${s2.voiceIndex})", !s2.mute && s2.voices == 3 && s2.voiceIndex == 1)
     println(if (fails == 0) "ALL LOGIC TESTS PASSED" else "FAILURES: $fails")
 }

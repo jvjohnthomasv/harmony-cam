@@ -155,6 +155,13 @@ fun SettingsSheet(vm: StudioViewModel, onPickTrack: () -> Unit, onDismiss: () ->
             Toggle("Hand tracking overlay (green skeleton, red joints)", s.handOverlay) { v -> set { it.copy(handOverlay = v) } }
             Toggle("Glowing orb & sparkles at the thumb", s.orb) { v -> set { it.copy(orb = v) } }
             Hint("The overlay is drawn into the recorded video too. The camera image itself is never stretched or filtered.")
+
+            Section("Video quality")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Chip("Max (4K if supported)", s.maxVideoQuality) { set { it.copy(maxVideoQuality = true) } }
+                Chip("1080p (smoothest)", !s.maxVideoQuality) { set { it.copy(maxVideoQuality = false) } }
+            }
+            Hint("If the preview or hand tracking ever feels sluggish while recording, 1080p gives the phone more headroom.")
             Spacer(Modifier.height(28.dp))
         }
     }

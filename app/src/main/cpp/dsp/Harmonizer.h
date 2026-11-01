@@ -316,7 +316,8 @@ public:
 
         const float humanize = clampf(c.humanize, 0, 1);
         const float width = clampf(c.width, 0, 1);
-        const float attack = smoothCoef(0.035f, sampleRate), release = smoothCoef(0.12f, sampleRate);
+        // fast but click-free: gestures (finger count, fist) take effect within ~10–50 ms
+        const float attack = smoothCoef(0.008f, sampleRate), release = smoothCoef(0.015f, sampleRate);
         const float level = clampf(c.harmonyLevel, 0, 1);
         const float dt = n / sampleRate;
         const bool chord = c.style < 0.5f;
@@ -326,7 +327,7 @@ public:
             bool active = t.active[v];
             if (!active && vc.env < 1e-4f) {
                 vc.idle += n;
-                if (vc.idle > sampleRate * 0.5f) { if (!vc.sleeping) { vc.sleeping = true; vc.psola.reset(); vc.delay.reset(); } continue; }
+                if (vc.idle > sampleRate * 2.0f) { if (!vc.sleeping) { vc.sleeping = true; vc.psola.reset(); vc.delay.reset(); } continue; }
             } else {
                 vc.idle = 0;
                 vc.sleeping = false;
