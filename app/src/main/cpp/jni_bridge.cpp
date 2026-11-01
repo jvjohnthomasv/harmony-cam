@@ -41,6 +41,8 @@ JNIEXPORT void JNICALL FN(nSetRouting)(JNIEnv *, jobject, jint inDev, jint outDe
     engine().setRouting(inDev, outDev, inChannel);
 }
 
+JNIEXPORT void JNICALL FN(nSetMonitorTuning)(JNIEnv *, jobject, jboolean on) { engine().setMonitorTuning(on == JNI_TRUE); }
+
 JNIEXPORT void JNICALL FN(nSetInputGainDb)(JNIEnv *, jobject, jfloat db) { engine().setInputGainDb(db); }
 
 JNIEXPORT void JNICALL FN(nSetMonitorGain)(JNIEnv *, jobject, jfloat gain) { engine().setMonitorGain(gain); }

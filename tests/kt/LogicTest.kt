@@ -70,11 +70,17 @@ fun main() {
     check("fist -> mute", st.mute)
     repeat(10) { st = g.update(listOf(hand(0.7f, 0.75f, booleanArrayOf(true, true, false, false))), false, true, 600 + it * 33L) }
     check("open again unmutes, 2 voices, low hand (v=${st.voices} h=${st.height})", !st.mute && st.voices == 2 && st.height < 0.3f)
-    // two hands: left one is FX; spread thumb/index wide
-    val fxHand = hand(0.25f, 0.5f, booleanArrayOf(true, true, true, true)).also { it[8] = 0.25f - 0.2f; it[9] = 0.5f }
-    repeat(15) { st = g.update(listOf(fxHand, hand(0.7f, 0.5f, booleanArrayOf(true, true, true, true))), false, true, 1000 + it * 33L) }
-    check("two hands: right is voice (4 voices), fx rises (fx=${st.fx})", st.voices == 4 && st.fx > 0.6f)
-    st = g.update(emptyList(), false, true, 2000)
+    // two hands: the raised one is the voice hand, the lower one is FX; spread thumb/index wide
+    val fxHand = hand(0.25f, 0.55f, booleanArrayOf(true, true, true, true)).also { it[8] = 0.25f - 0.2f; it[9] = 0.55f }
+    repeat(15) { st = g.update(listOf(fxHand, hand(0.7f, 0.3f, booleanArrayOf(true, true, true, true))), false, true, 1000 + it * 33L) }
+    check("two hands: raised is voice (4 voices), fx rises (fx=${st.fx})", st.voices == 4 && st.fx > 0.6f)
+    // mic hand: a low fist alone must NOT mute
+    repeat(6) { st = g.update(listOf(hand(0.4f, 0.8f, booleanArrayOf(false, false, false, false))), false, true, 1600 + it * 33L) }
+    check("low fist (holding mic) doesn't mute", !st.mute && st.voices == 4)
+    // raised hand + mic hand: still 4 voices from the raised hand
+    repeat(6) { st = g.update(listOf(hand(0.4f, 0.8f, booleanArrayOf(false, false, false, false)), hand(0.7f, 0.3f, booleanArrayOf(true, true, true, true))), false, true, 1900 + it * 33L) }
+    check("raised hand + mic hand -> 4 voices, not muted", !st.mute && st.voices == 4)
+    st = g.update(emptyList(), false, true, 2500)
     check("hand lost holds state", st.voices == 4 && !st.mute)
     println(if (fails == 0) "ALL LOGIC TESTS PASSED" else "FAILURES: $fails")
 }

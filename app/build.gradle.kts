@@ -109,6 +109,9 @@ dependencies {
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
+    implementation("androidx.camera:camera-video:$camerax")
+    implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-effects:$camerax")
 
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
     implementation("com.google.oboe:oboe:1.9.3")

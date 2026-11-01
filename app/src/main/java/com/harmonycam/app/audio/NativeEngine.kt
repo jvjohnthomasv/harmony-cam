@@ -24,7 +24,11 @@ object NativeEngine {
     const val C_DOUBLER = 14
     const val C_ECHO = 15
     const val C_BYPASS = 16
-    const val NUM_CONTROLS = 17
+    const val C_STYLE = 17
+    const val NUM_CONTROLS = 18
+
+    const val STYLE_CHORD = 0f
+    const val STYLE_INTERVALS = 1f
 
     // Meter indices — must match hc::MeterIndex.
     const val M_RMS_DB = 0
@@ -63,6 +67,8 @@ object NativeEngine {
     /** Device ids from AudioDeviceInfo.id (0 = system default). Applied on the next nStart(). */
     external fun nSetRouting(inputDeviceId: Int, outputDeviceId: Int, inputChannel: Int)
     external fun nSetInputGainDb(db: Float)
+    /** Hear pitch correction live (adds ~20 ms to your own voice) or monitor the dry lead. */
+    external fun nSetMonitorTuning(on: Boolean)
     external fun nSetMonitorGain(gain: Float)
     external fun nSetAsrEnabled(enabled: Boolean)
     external fun nReadAsr(buffer: ShortArray): Int

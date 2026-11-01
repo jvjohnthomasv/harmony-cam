@@ -7,11 +7,11 @@ import kotlin.math.min
 /**
  * Turns raw hand landmarks into harmony controls.
  *
- * Voice hand (right side of the screen, or the only hand):
+ * Voice hand (the raised / higher hand, or the only hand):
  *   - raised fingers (index..pinky) = number of harmony voices (1–4)
  *   - hand height = harmony layout (low → below the melody, high → above)
  *   - closed fist = harmonies muted
- * FX hand (left side of the screen):
+ * FX hand (the other, lower hand — a low fist holding the mic is ignored):
  *   - thumb–index spread = reverb / visual intensity (pinched = dry, spread = huge)
  *
  * Landmarks are 21 points × (x, y), normalised 0..1 in the upright, mirrored (selfie) image.
@@ -52,14 +52,15 @@ class GestureInterpreter {
     fun update(hands: List<FloatArray>, swapHands: Boolean, holdWhenLost: Boolean, nowMs: Long): State {
         var voiceHand: FloatArray? = null
         var fxHand: FloatArray? = null
-        when (hands.size) {
+        // A low, closed hand is almost always the one holding the mic: never let it mute/steer.
+        val usable = hands.take(2).filter { !(palmCenter(it).second > LOW_HAND_Y && isFist(it) && fingerCount(it) == 0) }
+        when (usable.size) {
             0 -> {}
-            1 -> voiceHand = hands[0]
+            1 -> voiceHand = usable[0]
             else -> {
-                val sorted = hands.take(2).sortedBy { palmCenter(it).first }
-                val left = sorted[0]
-                val right = sorted[1]
-                if (swapHands) { voiceHand = left; fxHand = right } else { voiceHand = right; fxHand = left }
+                // the raised (higher) hand plays the harmonies, the other one is the FX hand
+                val sorted = usable.sortedBy { palmCenter(it).second }
+                if (swapHands) { voiceHand = sorted[1]; fxHand = sorted[0] } else { voiceHand = sorted[0]; fxHand = sorted[1] }
             }
         }
 
@@ -73,12 +74,12 @@ class GestureInterpreter {
 
             // debounce mute so a quick finger change doesn't cut the harmonies
             if (fist) muteFrames++ else muteFrames = 0
-            if (muteFrames >= 3) mute = true
+            if (muteFrames >= 2) mute = true
             if (!fist && count > 0) mute = false
 
             if (count > 0) {
                 if (count == candidateVoices) candidateFrames++ else { candidateVoices = count; candidateFrames = 1 }
-                if (candidateFrames >= 3) voices = candidateVoices
+                if (candidateFrames >= 2) voices = candidateVoices
             }
 
             // height: palm centre, active band 0.15..0.85 of the frame
@@ -112,6 +113,8 @@ class GestureInterpreter {
 
     companion object {
         const val WRIST = 0
+        const val LOW_HAND_Y = 0.62f
+        fun fingerCount(h: FloatArray): Int = (0 until 4).count { isFingerExtended(h, it) }
         const val THUMB_TIP = 4
         const val INDEX_TIP = 8
         private val MCP = intArrayOf(5, 9, 13, 17)

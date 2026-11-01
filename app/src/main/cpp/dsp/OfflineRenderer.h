@@ -101,7 +101,7 @@ inline RenderResult renderPerformance(const std::string &dryWavPath, const std::
     const int L = bank.latencySamples();
     const int inLat = bank.inputLatency();
     LeadProcessor lead;
-    lead.setup((float) sr, true, L);
+    lead.setup((float) sr, true, bank.pitchMarker());
 
     WavWriter writer;
     if (!writer.open(outWavPath, sr, 2)) { res.error = "cannot write output"; return res; }
@@ -121,7 +121,7 @@ inline RenderResult renderPerformance(const std::string &dryWavPath, const std::
         VoiceTargets tg = targetBrain.targets(ns, c);
         std::fill(hl.begin(), hl.end(), 0.0f);
         std::fill(hr.begin(), hr.end(), 0.0f);
-        bank.process(in.data(), n, tg, c, ns.voiced ? ns.f0 : 0.0f, hl.data(), hr.data());
+        bank.process(in.data(), n, tg, c, ns, hl.data(), hr.data());
         lead.process(in.data(), n, ns, c, leadOut.data(), hl.data(), hr.data());
         // raw (unprocessed) vocal aligned to the output, for bypassed sections
         for (int i = 0; i < n; ++i) {

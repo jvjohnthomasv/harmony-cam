@@ -58,7 +58,6 @@ import com.harmonycam.app.Notes
 import com.harmonycam.app.StudioSettings
 import com.harmonycam.app.StudioViewModel
 import com.harmonycam.app.audio.AudioRouting
-import com.harmonycam.app.gl.VisualStyle
 import com.harmonycam.app.lyrics.LyricsStore
 import com.harmonycam.app.lyrics.Song
 
@@ -86,6 +85,13 @@ fun SettingsSheet(vm: StudioViewModel, onPickTrack: () -> Unit, onDismiss: () ->
             }
             Hint(if (s.keyRoot < 0) "Auto listens for ~3 s of singing, then locks harmonies to the detected key. Pick the key yourself for the most accurate harmonies from the first note." else "Harmonies stay inside ${Notes.key(s.keyRoot, s.minor)}.")
 
+            Section("Harmony style")
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Chip("Digital chord (reel)", s.chordStyle) { set { it.copy(chordStyle = true) } }
+                Chip("Classic intervals", !s.chordStyle) { set { it.copy(chordStyle = false) } }
+            }
+            Hint(if (s.chordStyle) "A full chord from the key around every note you sing — deep bass on the chord root plus voices above and below, each locked to its exact note (the glassy “digital harmonies” sound)." else "Natural 3rds/5ths that follow your voice, vibrato included.")
+
             Section("Harmony sound")
             LabeledSlider("Harmony level", s.harmonyLevel) { v -> set { it.copy(harmonyLevel = v) } }
             LabeledSlider("Lead vocal level", s.leadLevel) { v -> set { it.copy(leadLevel = v) } }
@@ -95,10 +101,10 @@ fun SettingsSheet(vm: StudioViewModel, onPickTrack: () -> Unit, onDismiss: () ->
 
             Section("Hand gestures")
             Toggle("Control harmonies with hands", s.gestures) { v -> set { it.copy(gestures = v) } }
-            Toggle("Swap hands (left hand = voices)", s.swapHands) { v -> set { it.copy(swapHands = v) } }
+            Toggle("Swap hands (lower hand = voices)", s.swapHands) { v -> set { it.copy(swapHands = v) } }
             Toggle("Keep harmonies when hand leaves frame", s.holdWhenLost) { v -> set { it.copy(holdWhenLost = v) } }
             Toggle("Show hand skeleton glow", s.showSkeleton) { v -> set { it.copy(showSkeleton = v) } }
-            Hint("Voice hand: 1–4 raised fingers = number of harmony voices · raise/lower = harmonies above/below · fist = mute. FX hand: spread thumb and index apart for more reverb and stronger visuals.")
+            Hint("Raised hand: 1–4 fingers = number of voices (open palm = full chord) · raise/lower = voicing above/below · fist = mute. Other hand: spread thumb and index for more reverb. A low fist holding the mic is ignored.")
 
             Section("Microphone & live monitoring")
             val r = vm.route
@@ -145,21 +151,10 @@ fun SettingsSheet(vm: StudioViewModel, onPickTrack: () -> Unit, onDismiss: () ->
             Toggle("Set the harmony key from the track", s.trackSetsKey) { v -> set { it.copy(trackSetsKey = v) } }
             Hint("The track plays in your headphones while you sing and restarts with every take. Delay between headphones and mic is measured automatically; use the nudge only if the saved video sounds slightly early or late.")
 
-            Section("Visual style")
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (st in VisualStyle.entries) Chip(st.label, s.style == st) { set { it.copy(style = st) } }
-            }
-
-            Section("Camera")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { set { it.copy(camExtraRotation = (it.camExtraRotation + 90) % 360) } }) {
-                    Text("Rotate 90° (${s.camExtraRotation}°)")
-                }
-                OutlinedButton(onClick = { set { it.copy(camMirror = !it.camMirror) } }) {
-                    Text(if (s.camMirror) "Mirror: on" else "Mirror: off")
-                }
-            }
-            Hint("Only needed if the camera image looks sideways or flipped on your phone.")
+            Section("Visuals")
+            Toggle("Hand tracking overlay (green skeleton, red joints)", s.handOverlay) { v -> set { it.copy(handOverlay = v) } }
+            Toggle("Glowing orb & sparkles at the thumb", s.orb) { v -> set { it.copy(orb = v) } }
+            Hint("The overlay is drawn into the recorded video too. The camera image itself is never stretched or filtered.")
             Spacer(Modifier.height(28.dp))
         }
     }
@@ -354,7 +349,8 @@ fun FxSheet(vm: StudioViewModel, onDismiss: () -> Unit) {
                     Chip("Studio", s.correction > 0.6f && s.retune in 0.25f..0.5f) { set { it.copy(correction = 0.9f, retune = 0.4f) } }
                     Chip("Robot", s.correction > 0.6f && s.retune < 0.1f) { set { it.copy(correction = 1f, retune = 0f) } }
                 }
-                Hint("Pulls your lead vocal onto the notes of the key (${Notes.key(s.keyRoot, s.minor)}). Natural keeps your vibrato; hard gives the classic auto-tune sound. Live monitoring adds about 20 ms while it's on.")
+                Toggle("Hear tuning live in headphones (+20 ms)", s.monitorTuning) { v -> set { it.copy(monitorTuning = v) } }
+                Hint("Pulls your lead vocal onto the notes of the key (${Notes.key(s.keyRoot, s.minor)}). Natural keeps your vibrato; hard gives the classic auto-tune sound. With live tuning off you hear your own voice with zero delay — the tuning is still applied to the saved video.")
 
                 Section("Space & texture")
                 LabeledSlider("Reverb", s.reverb) { v -> set { it.copy(reverb = v) } }

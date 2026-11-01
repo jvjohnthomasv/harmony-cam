@@ -44,6 +44,9 @@ public:
         inDeviceId = inputDeviceId; outDeviceId = outputDeviceId; inChannelMode = inputChannel;
     }
     void setInputGainDb(float db) { inputGain.store(dbToGain(db)); }
+    // false: hear your own voice dry (zero delay) even when pitch correction is on; the
+    // correction is still applied to the recording.
+    void setMonitorTuning(bool on) { monitorTuning.store(on); }
 
     void setControl(int index, float value);
     void setMonitorGain(float g) { monitorGain.store(g); }
@@ -84,6 +87,7 @@ private:
     int sampleRate = 48000;
     int inDeviceId = 0, outDeviceId = 0, inChannelMode = 0, inChannels = 1;
     std::atomic<float> inputGain{1.0f};
+    std::atomic<bool> monitorTuning{false};
 
     // DSP (audio thread only)
     HarmonyBrain brain;

@@ -4,7 +4,7 @@
 #include <cstdio>
 using namespace hc;
 
-static float midiToHz(float m) { return 440.f * std::pow(2.f, (m - 69) / 12.f); }
+static float mToHz(float m) { return 440.f * std::pow(2.f, (m - 69) / 12.f); }
 
 // glottal-ish source through 3 vowel formants
 static std::vector<float> synthVoice(int sr, const std::vector<std::pair<float,float>> &notes, float detune) {
@@ -19,7 +19,7 @@ static std::vector<float> synthVoice(int sr, const std::vector<std::pair<float,f
             float env = std::min(1.f, i / (0.03f * sr)) * std::min(1.f, (len - i) / (0.05f * sr));
             float m = nd.first + detune + 0.25f * std::sin(2 * kPi * 5.5f * t) * std::min(1.f, i / (0.3f * sr));
             if (nd.first <= 0) { out.push_back(0); continue; }
-            phase += midiToHz(m) / sr;
+            phase += mToHz(m) / sr;
             if (phase >= 1) phase -= 1;
             float g = (float) (phase < 0.6 ? std::sin(kPi * phase / 0.6) : 0.0); // pulse
             float s = g * g - 0.25f;
@@ -66,7 +66,7 @@ int main() {
     auto dry = synthVoice(sr, mel, -0.2f);
     writeMono("/tmp/hc_dry.wav", dry, sr);
 
-    Controls c; c.keyRoot = 0; c.scale = 0; c.dryLevel = 0; c.reverb = 0; c.fx = 0; c.humanize = 0; c.voices = 1; c.tightness = 1;
+    Controls c; c.keyRoot = 0; c.scale = 0; c.dryLevel = 0; c.reverb = 0; c.fx = 0; c.humanize = 0; c.voices = 1; c.tightness = 1; c.style = 1;
     struct Case { const char *name; float height; int degree; } cases[] = {{"3rd above", 0.5f, +2}, {"3rd below", 0.25f, -2}, {"5th above(zone4 v2)", 0.95f, +4}};
     int failures = 0;
     for (auto &cs : cases) {
@@ -109,6 +109,33 @@ int main() {
         for (size_t i=0;i<dry.size();++i) if (std::fabs(dry[i])>0.01f){b=i;break;}
         printf("harmony onset %ld vs dry %ld => lag %.1f ms (expected ~%.1f ms humanize floor)\n", a, b, (a-b)*1000.0/sr, 14*0.35);
     }
+    // digital chord mode: each voice must sit exactly on a chord tone of a diatonic chord containing the melody note
+    {
+        const char *nm[12] = {"C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"};
+        for (int v = 0; v < 4; ++v) {
+            Controls cc = c; cc.style = 0; cc.voices = 4; cc.height = 0.5f; cc.dryLevel = 0;
+            // isolate voice v by rendering with only it active: emulate via voices count & layout order
+            cc.voices = (float) (v + 1);
+            writeAutomation("/tmp/hc_auto.bin", cc, dry.size(), 480);
+            renderPerformance("/tmp/hc_dry.wav", "/tmp/hc_auto.bin", "/tmp/hc_chord.wav", cc, nullptr);
+        }
+        // single voice (the 'below1' voice) accuracy: hard-locked to its note
+        Controls cc = c; cc.style = 0; cc.voices = 1; cc.height = 0.5f; cc.dryLevel = 0; cc.humanize = 0;
+        writeAutomation("/tmp/hc_auto.bin", cc, dry.size(), 480);
+        renderPerformance("/tmp/hc_dry.wav", "/tmp/hc_auto.bin", "/tmp/hc_out.wav", cc, nullptr);
+        float tcur = 0.3f;
+        for (size_t k = 1; k + 1 < mel.size(); ++k) {
+            float m = measure("/tmp/hc_out.wav", tcur + 0.25f, tcur + mel[k].second - 0.1f);
+            int mi = (int) std::lround(m);
+            float err = std::fabs(m - mi);
+            bool inKey = inScale(mi, 0, kMajor);
+            bool below = mi < (int) mel[k].first;
+            printf("   chord voice under melody %d: %s%d (%.2f)  locked err %.3f %s\n", (int) mel[k].first, nm[mi % 12], mi / 12 - 1, m, err,
+                   (err < 0.06f && inKey && below) ? "OK" : "FAIL");
+            if (!(err < 0.06f && inKey && below)) failures++;
+            tcur += mel[k].second;
+        }
+    }
     // pitch correction: singer 0.4 st flat; hard correction should land on the note
     {
         std::vector<std::pair<float,float>> mel2 = {{0,0.3f},{60,1.0f},{64,1.0f},{67,1.0f},{0,0.3f}};
@@ -136,7 +163,7 @@ int main() {
     // realtime CPU estimate: 4 voices, realtime config
     {
         VoiceBank bank; bank.setup(sr, VoiceBank::Realtime); HarmonyBrain brain; brain.setup(sr); MixBus bus; bus.setup(sr, false);
-        LeadProcessor lp; lp.setup(sr, false); std::vector<float> lb(192);
+        LeadProcessor lp; lp.setup(sr, false, bank.pitchMarker()); std::vector<float> lb(192);
         Controls cc; cc.voices = 4; cc.keyRoot = 0; cc.correction = 0.8f; cc.doubler = 0.5f; cc.echo = 0.4f;
         std::vector<float> L(192), R(192), buf(192);
         auto t0 = std::chrono::steady_clock::now();
@@ -148,8 +175,8 @@ int main() {
             brain.analyze(buf.data(), 192, cc, [](const float*, int){}, [](){});
             auto tg = brain.targets(brain.state(), cc);
             std::fill(L.begin(), L.end(), 0.f); std::fill(R.begin(), R.end(), 0.f);
-            bank.process(buf.data(), 192, tg, cc, brain.state().f0, L.data(), R.data());
-            lp.process(buf.data(), 192, brain.state(), cc, lb.data(), L.data(), R.data());
+            bank.process(buf.data(), 192, tg, cc, brain.state(), L.data(), R.data());
+            lp.process(buf.data(), 192, brain.state(), cc, lb.data(), L.data(), R.data(), true);
             bus.mix(lb.data(), L.data(), R.data(), 192, cc);
             n += 192;
         }

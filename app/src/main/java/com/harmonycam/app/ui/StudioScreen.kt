@@ -1,7 +1,6 @@
 package com.harmonycam.app.ui
 
 import android.content.Intent
-import android.opengl.GLSurfaceView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -40,7 +39,6 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
-import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.automirrored.rounded.Article
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.GraphicEq
@@ -91,8 +89,8 @@ import com.harmonycam.app.MainActivity
 import com.harmonycam.app.Notes
 import com.harmonycam.app.StudioViewModel
 import com.harmonycam.app.audio.AudioRouting
-import com.harmonycam.app.gl.EffectsRenderer
-import com.harmonycam.app.gl.VisualStyle
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.gestures.detectTransformGestures
 import com.harmonycam.app.lyrics.LyricMatcher
 import com.harmonycam.app.lyrics.LyricsTracker
 import com.harmonycam.app.record.Take
@@ -109,19 +107,13 @@ fun StudioScreen(vm: StudioViewModel) {
     }
     LaunchedEffect(Unit) { if (!granted) launcher.launch(MainActivity.REQUIRED) }
 
-    val glView = remember {
-        GLSurfaceView(context).apply {
-            setEGLContextClientVersion(2)
-            setEGLConfigChooser(EffectsRenderer.configChooser())
-            preserveEGLContextOnPause = true
-        }
-    }
-    remember {
-        EffectsRenderer(glView).also {
-            glView.setRenderer(it)
-            glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-            vm.attachRenderer(it)
-        }
+    // CameraX's own preview: shown exactly as the camera delivers it, fitted to the screen
+    // (no stretching, no extra cropping, no re-scaling by the app)
+    val previewView = remember {
+        PreviewView(context).apply {
+            scaleType = PreviewView.ScaleType.FIT_CENTER
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }.also { vm.attachPreview(it) }
     }
 
     val owner = LocalLifecycleOwner.current
@@ -129,8 +121,6 @@ fun StudioScreen(vm: StudioViewModel) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_START -> if (granted) vm.onStart(owner)
-                Lifecycle.Event.ON_RESUME -> glView.onResume()
-                Lifecycle.Event.ON_PAUSE -> glView.onPause()
                 Lifecycle.Event.ON_STOP -> vm.onStop()
                 else -> {}
             }
@@ -152,7 +142,13 @@ fun StudioScreen(vm: StudioViewModel) {
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(factory = { glView }, modifier = Modifier.fillMaxSize())
+        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        // pinch anywhere on the camera to zoom (uses the camera's own zoom range)
+        Box(
+            Modifier.fillMaxSize().pointerInput(Unit) {
+                detectTransformGestures { _, _, zoomChange, _ -> if (zoomChange != 1f) vm.zoomBy(zoomChange) }
+            }
+        )
 
         // top scrim for legibility
         Box(
@@ -406,12 +402,13 @@ private fun BottomControls(vm: StudioViewModel, onTakes: () -> Unit) {
         }
         if (s.gestures) {
             val g = vm.gesture
-            val hint = if (g.voiceHand == null) "✋ Show your hand: fingers = voices · height = harmony · fist = mute · left-hand pinch = reverb"
+            val hint = if (g.voiceHand == null) "✋ Raise a hand: fingers = voices (open palm = full chord) · height = voicing · fist = mute"
             else "${g.voices} voice${if (g.voices == 1) "" else "s"} · ${heightLabel(g.height)}${if (g.fxHand != null) " · FX ${(g.fx * 100).toInt()}%" else ""}"
             Text(hint, color = Hc.TextDim, fontSize = 12.sp, textAlign = TextAlign.Center)
         } else {
             ManualHarmonyControls(vm)
         }
+        ZoomSlider(vm)
         if (vm.activeSong != null && !vm.prompterVisible) {
             Spacer(Modifier.height(6.dp))
             Pill(onClick = { vm.prompterVisible = true }) { Text("Show lyrics", color = Hc.Text, fontSize = 12.sp) }
@@ -428,12 +425,7 @@ private fun BottomControls(vm: StudioViewModel, onTakes: () -> Unit) {
                 }
             }
             RecordButton(vm.recording, vm.meters.recSeconds) { vm.toggleRecording() }
-            RoundIcon(Icons.Rounded.AutoAwesome, "Visual style", onClick = {
-                val all = VisualStyle.entries
-                val nextStyle = all[(all.indexOf(s.style) + 1) % all.size]
-                vm.updateSettings { it.copy(style = nextStyle) }
-                vm.message = "Look: ${nextStyle.label}"
-            })
+            ZoomButton(vm)
         }
     }
 }
@@ -617,4 +609,38 @@ fun shareTake(context: android.content.Context, take: Take) {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     context.startActivity(Intent.createChooser(send, "Share take"))
+}
+
+
+/** Shows the current zoom; tap cycles through the camera's own stops (widest, 1×, 2×, max). */
+@Composable
+private fun ZoomButton(vm: StudioViewModel) {
+    val z = vm.zoom
+    val label = if (z == null) "1×" else (if (z.current < 0.995f) "%.1f×".format(z.current) else if (z.current < 10f) "%.1f×".format(z.current).replace(".0×", "×") else "%.0f×".format(z.current))
+    Box(
+        Modifier.size(42.dp).clip(CircleShape).background(Hc.PanelSoft).border(1.dp, Hc.Line, CircleShape).clickable {
+            if (z != null) {
+                val stops = listOf(z.min, 1f, 2f, z.max).filter { it >= z.min - 1e-3f && it <= z.max + 1e-3f }.distinct().sorted()
+                val next = stops.firstOrNull { it > z.current + 0.05f } ?: stops.first()
+                vm.setZoom(next)
+            }
+        },
+        contentAlignment = Alignment.Center
+    ) { Text(label, color = Hc.Text, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
+}
+
+/** Zoom slider over the camera's full native range. */
+@Composable
+fun ZoomSlider(vm: StudioViewModel, modifier: Modifier = Modifier) {
+    val z = vm.zoom ?: return
+    if (z.max - z.min < 0.05f) return
+    Row(modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("%.1f×".format(z.min), color = Hc.TextDim, fontSize = 11.sp)
+        Slider(
+            value = ((z.current - z.min) / (z.max - z.min)).coerceIn(0f, 1f),
+            onValueChange = { v -> vm.setZoom(z.min + v * (z.max - z.min)) },
+            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+        )
+        Text("%.0f×".format(z.max), color = Hc.TextDim, fontSize = 11.sp)
+    }
 }

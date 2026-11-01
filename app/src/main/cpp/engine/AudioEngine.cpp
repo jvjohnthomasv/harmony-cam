@@ -40,7 +40,7 @@ void AudioEngine::prepareDsp() {
     brain.setup((float) sampleRate);
     bank.setup((float) sampleRate, VoiceBank::Realtime);
     bus.setup((float) sampleRate, false);
-    lead.setup((float) sampleRate, false);
+    lead.setup((float) sampleRate, false, bank.pitchMarker());
     const int maxFrames = 8192;
     leadBuf.assign(maxFrames, 0.0f);
     dry.assign(maxFrames, 0.0f); cond.assign(maxFrames, 0.0f);
@@ -274,8 +274,8 @@ oboe::DataCallbackResult AudioEngine::onBothStreamsReady(const void *inputData, 
         tg = brain.targets(ns0, c);
         std::fill(L.begin(), L.begin() + n, 0.0f);
         std::fill(R.begin(), R.begin() + n, 0.0f);
-        bank.process(cond.data(), n, tg, c, ns0.voiced ? ns0.f0 : 0.0f, L.data(), R.data());
-        lead.process(cond.data(), n, ns0, c, leadBuf.data(), L.data(), R.data());
+        bank.process(cond.data(), n, tg, c, ns0, L.data(), R.data());
+        lead.process(cond.data(), n, ns0, c, leadBuf.data(), L.data(), R.data(), monitorTuning.load(std::memory_order_relaxed));
         bus.mix(leadBuf.data(), L.data(), R.data(), n, c, TL.data(), TR.data());
     }
     const NoteState &ns = brain.state();

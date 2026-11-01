@@ -17,15 +17,15 @@ import com.harmonycam.app.audio.TrackDecoder
 import com.harmonycam.app.camera.CameraController
 import com.harmonycam.app.gesture.GestureInterpreter
 import com.harmonycam.app.gesture.HandTracker
-import com.harmonycam.app.gl.EffectsRenderer
-import com.harmonycam.app.gl.VisualInput
+import androidx.camera.view.PreviewView
+import com.harmonycam.app.camera.HandOverlay
+import kotlinx.coroutines.CompletableDeferred
 import com.harmonycam.app.lyrics.LyricsStore
 import com.harmonycam.app.lyrics.LyricsTracker
 import com.harmonycam.app.lyrics.Song
 import com.harmonycam.app.record.ExportPipeline
 import com.harmonycam.app.record.Take
 import com.harmonycam.app.record.TakesStore
-import com.harmonycam.app.record.VideoEncoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -33,7 +33,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.math.max
 
 data class Meters(
     val level: Float = 0f,
@@ -82,6 +81,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     var trackLoading by mutableStateOf(false); private set
     var trackLoadProgress by mutableFloatStateOf(0f); private set
     var trackKey by mutableStateOf<Pair<Int, Boolean>?>(null); private set
+    var zoom by mutableStateOf<CameraController.ZoomInfo?>(null); private set
 
     private val store = LyricsStore(ctx)
     private val takesStore = TakesStore(ctx)
@@ -90,24 +90,21 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private val exportPipeline = ExportPipeline(ctx)
     private val lyrics = LyricsTracker(ctx, viewModelScope)
     private var handTracker: HandTracker? = null
-    private var renderer: EffectsRenderer? = null
+    private var previewView: PreviewView? = null
+    val overlay = HandOverlay()
     private val routing = AudioRouting(ctx) { r -> onRouteChanged(r) }
     private var meterJob: Job? = null
     private var started = false
     private var owner: LifecycleOwner? = null
     private val trackFile = File(ctx.filesDir, "track/current.wav")
 
-    // snapshot for the GL thread
-    @Volatile private var visualHands: Pair<FloatArray?, FloatArray?> = null to null
-    @Volatile private var visualMeters = Meters()
-    @Volatile private var visualGesture = GestureInterpreter.State()
     private var smoothLevel = 0f
-    private var pulse = 0f
 
     // recording state
-    private var encoder: VideoEncoder? = null
     private var takeDir: File? = null
     private var recordStartNs = 0L
+    @Volatile private var videoStartNs = 0L
+    private var videoResult: CompletableDeferred<File?>? = null
 
     init {
         songs = store.load()
@@ -124,21 +121,19 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     // ───────────────────────── lifecycle
 
-    fun attachRenderer(r: EffectsRenderer) {
-        renderer = r
-        r.style = settings.style
-        r.extraRotation = settings.camExtraRotation
-        r.mirror = settings.camMirror
-        r.inputProvider = { input -> fillVisuals(input) }
-        r.onSurfaceTextureRecreated = { rebindCamera() }
+    fun attachPreview(view: PreviewView) {
+        previewView = view
+        camera.onZoomChanged = { z -> viewModelScope.launch(Dispatchers.Main) { zoom = z } }
+        applyOverlaySettings()
     }
 
-    private fun rebindCamera() {
-        val o = owner ?: return
-        val r = renderer ?: return
-        val t = handTracker ?: return
-        if (started) camera.bind(o, r, t)
+    private fun applyOverlaySettings() {
+        overlay.enabled = settings.handOverlay
+        overlay.orbEnabled = settings.orb
     }
+
+    fun setZoom(ratio: Float) = camera.setZoom(ratio)
+    fun zoomBy(factor: Float) = camera.zoomBy(factor)
 
     /** Called when permissions are granted and the activity is started. */
     fun onStart(owner: LifecycleOwner) {
@@ -147,11 +142,11 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         this.owner = owner
         routing.register()
         startEngine(routing.current)
-        val r = renderer
-        if (r != null) {
-            val tracker = handTracker ?: HandTracker(ctx) { hands, t -> onHands(hands, t) }.also { handTracker = it }
-            tracker.enabled = settings.gestures
-            camera.bind(owner, r, tracker)
+        val view = previewView
+        if (view != null) {
+            val tracker = handTracker ?: HandTracker(ctx) { d -> onHands(d) }.also { handTracker = it }
+            tracker.enabled = settings.gestures || settings.handOverlay
+            camera.bind(owner, view, tracker, overlay)
         }
         meterJob = viewModelScope.launch { pollMeters() }
         activeSong?.let { startLyrics(it, lyricLine) }
@@ -232,6 +227,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         NativeEngine.nSetControl(NativeEngine.C_DOUBLER, s.doubler)
         NativeEngine.nSetControl(NativeEngine.C_ECHO, s.echo)
         NativeEngine.nSetControl(NativeEngine.C_BYPASS, if (s.effectsOff) 1f else 0f)
+        NativeEngine.nSetControl(NativeEngine.C_STYLE, if (s.chordStyle) NativeEngine.STYLE_CHORD else NativeEngine.STYLE_INTERVALS)
+        NativeEngine.nSetMonitorTuning(s.monitorTuning)
         val g = gesture
         NativeEngine.nSetControl(NativeEngine.C_VOICES, effectiveVoices(g.voices).toFloat())
         if (!s.gestures) {
@@ -250,8 +247,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         val s = transform(old)
         settings = s
         StudioSettings.save(ctx, s)
-        renderer?.let { it.style = s.style; it.extraRotation = s.camExtraRotation; it.mirror = s.camMirror }
-        handTracker?.enabled = s.gestures
+        applyOverlaySettings()
+        handTracker?.enabled = s.gestures || s.handOverlay
         if (s.gestures != old.gestures) interpreter.reset(s.manualVoices, s.manualHeight)
         pushControls()
         applyMonitor()
@@ -284,7 +281,9 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
                 trackLength = buf[NativeEngine.M_TRACK_LENGTH],
             )
             meters = m
-            visualMeters = m
+            smoothLevel += ((if (m.voiced) level else level * 0.4f) - smoothLevel) * 0.3f
+            overlay.level = smoothLevel
+            overlay.intensity = if (settings.gestures) gesture.fx else settings.manualFx
             delay(33)
         }
     }
@@ -361,49 +360,17 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     // ───────────────────────── gestures & visuals
 
-    private fun onHands(hands: List<FloatArray>, timeMs: Long) {
+    private fun onHands(d: HandTracker.Detection) {
         val s = settings
-        val g = interpreter.update(hands, s.swapHands, s.holdWhenLost, timeMs)
+        if (s.handOverlay) overlay.update(d)
+        val g = interpreter.update(d.mirrored, s.swapHands, s.holdWhenLost, d.uptimeMs)
         if (s.gestures) {
             NativeEngine.nSetControl(NativeEngine.C_VOICES, effectiveVoices(g.voices).toFloat())
             NativeEngine.nSetControl(NativeEngine.C_HEIGHT, g.height)
             NativeEngine.nSetControl(NativeEngine.C_MUTE, if (g.mute) 1f else 0f)
             NativeEngine.nSetControl(NativeEngine.C_FX, g.fx)
         }
-        val r = renderer
-        fun map(h: FloatArray?): FloatArray? {
-            if (h == null || r == null) return h
-            val out = FloatArray(h.size)
-            for (i in 0 until h.size / 2) {
-                val (x, y) = r.mapToFrame(h[2 * i], h[2 * i + 1])
-                out[2 * i] = x; out[2 * i + 1] = y
-            }
-            return out
-        }
-        visualHands = map(g.voiceHand) to map(g.fxHand)
-        visualGesture = g
         viewModelScope.launch(Dispatchers.Main) { gesture = g }
-    }
-
-    /** GL thread: fill the per-frame visual input. */
-    private fun fillVisuals(input: VisualInput) {
-        val m = visualMeters
-        val g = visualGesture
-        val s = settings
-        val target = if (m.voiced) m.level else m.level * 0.5f
-        val prev = smoothLevel
-        smoothLevel += (target - smoothLevel) * 0.2f
-        pulse = max(pulse * 0.9f, (smoothLevel - prev) * 8f).coerceIn(0f, 1f)
-        input.level = smoothLevel
-        input.pulse = pulse
-        input.fx = if (s.gestures) g.fx else s.manualFx
-        input.mute = s.gestures && g.mute
-        val (vh, fh) = visualHands
-        input.voiceHand = if (s.gestures) vh else null
-        input.fxHand = if (s.gestures) fh else null
-        input.extended = g.extended
-        input.showSkeleton = s.showSkeleton
-        for (i in 0 until 4) { input.voiceMidi[i] = m.voiceMidi[i]; input.voiceEnv[i] = m.voiceEnv[i] }
     }
 
     // ───────────────────────── recording & takes
@@ -417,18 +384,29 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         reviewTake = null
         val dir = File(ctx.cacheDir, "take_${System.currentTimeMillis()}").apply { mkdirs() }
         takeDir = dir
-        val enc = VideoEncoder.create(File(dir, "video.mp4"))
-        if (enc == null) message = "Video encoder unavailable — recording audio only"
         recordStartNs = System.nanoTime()
+        videoStartNs = 0L
+        // audio first: it must cover the first video frame (the export trims the excess)
         if (!NativeEngine.nStartRecording(File(dir, "vocal.wav").absolutePath, File(dir, "automation.bin").absolutePath)) {
-            enc?.finish()
             message = "Couldn't start recording"
             return
         }
-        encoder = enc
-        if (enc != null) renderer?.startRecording(enc, recordStartNs)
+        val done = CompletableDeferred<File?>()
+        videoResult = done
+        val started = camera.startRecording(
+            File(dir, "video.mp4"),
+            onStarted = {
+                val fallback = System.nanoTime()
+                overlay.armFirstFrame { ns -> videoStartNs = ns }
+                viewModelScope.launch { delay(400); if (videoStartNs == 0L) videoStartNs = fallback }
+            },
+            onFinished = { file, err ->
+                if (err != null) Log.w("Studio", err)
+                done.complete(file)
+            },
+        )
+        if (!started) { message = "Camera not ready — recording audio only"; done.complete(null) }
         recording = true
-        // each take starts the lyrics from the top
         if (activeSong != null) lyrics.jumpTo(0)
     }
 
@@ -438,36 +416,31 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         val res = NativeEngine.nStopRecording()
         val audioStartNs = res[1]
         val trackStartNs = if (res.size > 3) res[3] else 0L
+        camera.stopRecording()
         val dir = takeDir ?: return
-        val enc = encoder
-        encoder = null
         val s = settings
-        val rec = ExportPipeline.Recording(
-            dryWav = File(dir, "vocal.wav"),
-            automation = File(dir, "automation.bin"),
-            videoOnly = null,
-            audioStartNs = audioStartNs,
-            videoStartNs = recordStartNs,
-            fallbackControls = currentControlsArray(),
-            trackWav = if (trackLoaded) trackFile else null,
-            trackStartNs = trackStartNs,
-            trackGain = s.trackLevel,
-            trackNudgeMs = s.trackNudgeMs,
-            output = takesStore.newFile(),
-        )
-        val finishVideo: () -> Unit = {
-            viewModelScope.launch(Dispatchers.Default) {
-                val video = enc?.finish()
-                export(rec.withVideo(video), dir)
-            }
+        val controls = currentControlsArray()
+        val output = takesStore.newFile()
+        val pendingVideo = videoResult
+        viewModelScope.launch(Dispatchers.Default) {
+            val video = try { kotlinx.coroutines.withTimeoutOrNull(8000) { pendingVideo?.await() } } catch (_: Exception) { null }
+            val vStart = if (videoStartNs != 0L) videoStartNs else recordStartNs
+            val rec = ExportPipeline.Recording(
+                dryWav = File(dir, "vocal.wav"),
+                automation = File(dir, "automation.bin"),
+                videoOnly = video,
+                audioStartNs = audioStartNs,
+                videoStartNs = vStart,
+                fallbackControls = controls,
+                trackWav = if (trackLoaded) trackFile else null,
+                trackStartNs = trackStartNs,
+                trackGain = s.trackLevel,
+                trackNudgeMs = s.trackNudgeMs,
+                output = output,
+            )
+            export(rec, dir)
         }
-        val r = renderer
-        if (enc != null && r != null) r.stopRecording { finishVideo() } else finishVideo()
     }
-
-    private fun ExportPipeline.Recording.withVideo(v: File?) = ExportPipeline.Recording(
-        dryWav, automation, v, audioStartNs, videoStartNs, fallbackControls, trackWav, trackStartNs, trackGain, trackNudgeMs, output
-    )
 
     private fun currentControlsArray(): FloatArray {
         val s = settings; val g = gesture
@@ -479,6 +452,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             s.keyRoot.toFloat(), if (s.minor) 1f else 0f, s.harmonyLevel, s.leadLevel,
             s.humanize, s.tightness, s.reverb, s.width,
             s.correction, s.retune, s.doubler, s.echo, if (s.effectsOff) 1f else 0f,
+            if (s.chordStyle) NativeEngine.STYLE_CHORD else NativeEngine.STYLE_INTERVALS,
         )
     }
 

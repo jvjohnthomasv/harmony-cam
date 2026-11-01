@@ -184,6 +184,14 @@ class ExportPipeline(private val context: Context) {
         var extractor: MediaExtractor? = null
         var videoTrack = -1
         if (videoOnly != null && videoOnly.exists() && videoOnly.length() > 0) {
+            // CameraX stores frames in sensor orientation + a rotation flag: keep that flag
+            try {
+                val r = android.media.MediaMetadataRetriever()
+                r.setDataSource(videoOnly.absolutePath)
+                val rot = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                r.release()
+                if (rot != 0) muxer.setOrientationHint(rot)
+            } catch (_: Exception) {}
             extractor = MediaExtractor().apply { setDataSource(videoOnly.absolutePath) }
             for (i in 0 until extractor.trackCount) {
                 val f = extractor.getTrackFormat(i)
@@ -211,11 +219,13 @@ class ExportPipeline(private val context: Context) {
             ex.advance()
         }
         readVideo()
+        val videoBase = if (vHas) vinfo.presentationTimeUs else 0L
         var ai = 0
         while (vHas || ai < audio.samples.size) {
             val aPts = if (ai < audio.samples.size) audio.samples[ai].second.presentationTimeUs else Long.MAX_VALUE
-            if (vHas && vinfo.presentationTimeUs <= aPts) {
+            if (vHas && vinfo.presentationTimeUs - videoBase <= aPts) {
                 vbuf.position(0); vbuf.limit(vinfo.size)
+                vinfo.presentationTimeUs -= videoBase
                 muxer.writeSampleData(videoTrack, vbuf, vinfo)
                 vbuf.clear()
                 readVideo()

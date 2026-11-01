@@ -1,18 +1,20 @@
 package com.harmonycam.app
 
 import android.content.Context
-import com.harmonycam.app.gl.VisualStyle
 
 data class StudioSettings(
     val keyRoot: Int = -1,            // -1 = auto-detect
     val minor: Boolean = false,
     val harmonyLevel: Float = 0.8f,
     val leadLevel: Float = 1.0f,
-    val humanize: Float = 0.7f,
+    val humanize: Float = 0.3f,
     val tightness: Float = 0.6f,
     val reverb: Float = 0.35f,
     val width: Float = 0.8f,
-    val style: VisualStyle = VisualStyle.NEON,
+    val chordStyle: Boolean = true,        // true: digital chord (reel sound), false: classic intervals
+    val handOverlay: Boolean = true,
+    val orb: Boolean = true,
+    val monitorTuning: Boolean = false,
     val gestures: Boolean = true,
     val swapHands: Boolean = false,
     val holdWhenLost: Boolean = true,
@@ -50,11 +52,14 @@ data class StudioSettings(
                 minor = p.getBoolean("minor", d.minor),
                 harmonyLevel = p.getFloat("harmonyLevel", d.harmonyLevel),
                 leadLevel = p.getFloat("leadLevel", d.leadLevel),
-                humanize = p.getFloat("humanize", d.humanize),
+                humanize = p.getFloat("humanize2", d.humanize),
                 tightness = p.getFloat("tightness", d.tightness),
                 reverb = p.getFloat("reverb", d.reverb),
                 width = p.getFloat("width", d.width),
-                style = runCatching { VisualStyle.valueOf(p.getString("style", d.style.name)!!) }.getOrDefault(d.style),
+                chordStyle = p.getBoolean("chordStyle", d.chordStyle),
+                handOverlay = p.getBoolean("handOverlay", d.handOverlay),
+                orb = p.getBoolean("orb", d.orb),
+                monitorTuning = p.getBoolean("monitorTuning", d.monitorTuning),
                 gestures = p.getBoolean("gestures", d.gestures),
                 swapHands = p.getBoolean("swapHands", d.swapHands),
                 holdWhenLost = p.getBoolean("holdWhenLost", d.holdWhenLost),
@@ -85,9 +90,10 @@ data class StudioSettings(
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putInt("keyRoot", s.keyRoot).putBoolean("minor", s.minor)
                 .putFloat("harmonyLevel", s.harmonyLevel).putFloat("leadLevel", s.leadLevel)
-                .putFloat("humanize", s.humanize).putFloat("tightness", s.tightness)
+                .putFloat("humanize2", s.humanize).putFloat("tightness", s.tightness)
                 .putFloat("reverb", s.reverb).putFloat("width", s.width)
-                .putString("style", s.style.name)
+                .putBoolean("chordStyle", s.chordStyle).putBoolean("handOverlay", s.handOverlay)
+                .putBoolean("orb", s.orb).putBoolean("monitorTuning", s.monitorTuning)
                 .putBoolean("gestures", s.gestures).putBoolean("swapHands", s.swapHands)
                 .putBoolean("holdWhenLost", s.holdWhenLost).putBoolean("showSkeleton", s.showSkeleton)
                 .putBoolean("speakerMonitor", s.speakerMonitor).putFloat("monitorLevel", s.monitorLevel)
