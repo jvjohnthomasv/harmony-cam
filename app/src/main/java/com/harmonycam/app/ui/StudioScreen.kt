@@ -39,9 +39,9 @@ import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material.icons.rounded.VisibilityOff
-import androidx.compose.material.icons.rounded.VolumeOff
+import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.AutoAwesome
-import androidx.compose.material.icons.rounded.Article
+import androidx.compose.material.icons.automirrored.rounded.Article
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.LibraryMusic
@@ -176,7 +176,7 @@ fun StudioScreen(vm: StudioViewModel) {
                 }
                 vm.engineError?.let {
                     Spacer(Modifier.height(8.dp))
-                    Banner(Icons.Rounded.VolumeOff, it, Hc.Record)
+                    Banner(Icons.AutoMirrored.Rounded.VolumeOff, it, Hc.Record)
                 }
             }
 
@@ -520,7 +520,7 @@ private fun SideTools(
 ) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
         ToolButton(Icons.Rounded.LibraryMusic, "Track", active = vm.trackLoaded, onClick = if (vm.trackLoaded) onPickTrack else onTrack)
-        ToolButton(Icons.Rounded.Article, "Lyrics", active = vm.activeSong != null, onClick = onLyrics)
+        ToolButton(Icons.AutoMirrored.Rounded.Article, "Lyrics", active = vm.activeSong != null, onClick = onLyrics)
         val fxActive = !vm.settings.effectsOff && (vm.settings.correction > 0f || vm.settings.doubler > 0f || vm.settings.echo > 0f)
         ToolButton(Icons.Rounded.GraphicEq, if (vm.settings.effectsOff) "FX off" else "FX", active = fxActive, warn = vm.settings.effectsOff, onClick = onFx)
     }

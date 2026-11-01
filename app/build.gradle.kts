@@ -19,7 +19,7 @@ android {
         versionName = "1.0"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a") // all phones running Android 10+ in practice
         }
         externalNativeBuild {
             cmake {
@@ -72,8 +72,9 @@ android {
     }
 
     androidResources {
-        // ML models are already compressed / memory-mapped
-        noCompress += listOf("task", "tflite", "mdl", "fst", "int", "conf", "mat", "ie", "dubm", "carpa")
+        // MediaPipe memory-maps its model straight from the APK, so it must stay uncompressed.
+        // (The speech model is copied out to storage on first use, so it can be compressed.)
+        noCompress += listOf("task", "tflite")
     }
 
     lint {
@@ -82,7 +83,9 @@ android {
     }
 
     packaging {
-        jniLibs { useLegacyPackaging = false }
+        // compressed native libs & dex: much smaller download (extracted once at install)
+        jniLibs { useLegacyPackaging = true }
+        dex { useLegacyPackaging = true }
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
 }
