@@ -1,0 +1,13 @@
+.gradle/
+build/
+app/build/
+app/.cxx/
+local.properties
+.idea/
+*.iml
+.DS_Store
+# downloaded at build time
+app/src/main/assets/hand_landmarker.task
+app/src/main/assets/model-en-us/
+vendor_src/
+tests/dsp_test
