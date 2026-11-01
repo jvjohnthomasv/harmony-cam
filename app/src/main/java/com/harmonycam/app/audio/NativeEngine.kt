@@ -19,7 +19,12 @@ object NativeEngine {
     const val C_TIGHTNESS = 9
     const val C_REVERB = 10
     const val C_WIDTH = 11
-    const val NUM_CONTROLS = 12
+    const val C_CORRECTION = 12
+    const val C_RETUNE = 13
+    const val C_DOUBLER = 14
+    const val C_ECHO = 15
+    const val C_BYPASS = 16
+    const val NUM_CONTROLS = 17
 
     // Meter indices — must match hc::MeterIndex.
     const val M_RMS_DB = 0
@@ -36,7 +41,10 @@ object NativeEngine {
     const val M_MIDI = 17
     const val M_INPUT_PEAK = 18
     const val M_INPUT_CHANNELS = 19
-    const val NUM_METERS = 20
+    const val M_TRACK_POS = 20
+    const val M_TRACK_PLAYING = 21
+    const val M_TRACK_LENGTH = 22
+    const val NUM_METERS = 23
 
     const val INPUT_CH_FIRST = 0
     const val INPUT_CH_SECOND = 1
@@ -61,8 +69,15 @@ object NativeEngine {
     external fun nGetMeters(out: FloatArray)
     external fun nStartRecording(wavPath: String, automationPath: String): Boolean
 
-    /** @return [framesWritten, firstFrameMonotonicNanos, sampleRate] */
+    /** @return [framesWritten, firstFrameMonotonicNanos, sampleRate, trackStartMonotonicNanos (0 = no track)] */
     external fun nStopRecording(): LongArray
+
+    /** Loads a decoded WAV backing track. @return [seconds, keyRoot, keyScale(0 major / 1 minor)] or null */
+    external fun nLoadTrack(path: String): FloatArray?
+    external fun nUnloadTrack()
+    external fun nSetTrackPlaying(playing: Boolean)
+    external fun nSeekTrack(seconds: Float)
+    external fun nSetTrackGain(gain: Float)
 
     /** Renders the studio-quality mix. Returns null on success or an error message. */
     external fun nRender(
@@ -70,6 +85,9 @@ object NativeEngine {
         automation: String,
         outWav: String,
         fallbackControls: FloatArray,
-        listener: ProgressListener?
+        listener: ProgressListener?,
+        trackPath: String,
+        trackOffsetSamples: Long,
+        trackGain: Float,
     ): String?
 }

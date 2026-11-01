@@ -32,7 +32,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.Mic
-import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.SkipNext
@@ -42,6 +41,17 @@ import androidx.compose.material.icons.rounded.Usb
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.VolumeOff
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Article
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.LibraryMusic
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SaveAlt
+import androidx.compose.material.icons.rounded.VideoLibrary
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -85,6 +95,9 @@ import com.harmonycam.app.gl.EffectsRenderer
 import com.harmonycam.app.gl.VisualStyle
 import com.harmonycam.app.lyrics.LyricMatcher
 import com.harmonycam.app.lyrics.LyricsTracker
+import com.harmonycam.app.record.Take
+import androidx.core.content.FileProvider
+import androidx.compose.foundation.layout.offset
 
 @Composable
 fun StudioScreen(vm: StudioViewModel) {
@@ -128,6 +141,11 @@ fun StudioScreen(vm: StudioViewModel) {
 
     var showSettings by remember { mutableStateOf(false) }
     var showLyrics by remember { mutableStateOf(false) }
+    var showFx by remember { mutableStateOf(false) }
+    var showTakes by remember { mutableStateOf(false) }
+    val pickTrack = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.pickTrack(uri)
+    }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(vm.message) {
         vm.message?.let { snackbar.showSnackbar(it); vm.message = null }
@@ -150,7 +168,7 @@ fun StudioScreen(vm: StudioViewModel) {
             PermissionCard(Modifier.align(Alignment.Center)) { launcher.launch(MainActivity.REQUIRED) }
         } else {
             Column(Modifier.statusBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                TopBar(vm, onSettings = { showSettings = true }, onLyrics = { showLyrics = true })
+                TopBar(vm, onSettings = { showSettings = true })
                 val r = vm.route
                 if (r != null && r.output == AudioRouting.OutputKind.SPEAKER && !vm.settings.speakerMonitor) {
                     Spacer(Modifier.height(8.dp))
@@ -162,6 +180,14 @@ fun StudioScreen(vm: StudioViewModel) {
                 }
             }
 
+            SideTools(
+                vm,
+                Modifier.align(Alignment.TopStart).statusBarsPadding().padding(start = 12.dp, top = 64.dp),
+                onTrack = { if (vm.trackLoaded) vm.toggleTrackPlayback() else pickTrack.launch(arrayOf("audio/*")) },
+                onPickTrack = { pickTrack.launch(arrayOf("audio/*")) },
+                onLyrics = { showLyrics = true },
+                onFx = { showFx = true },
+            )
             VoiceHud(vm, Modifier.align(Alignment.CenterEnd).padding(end = 10.dp))
 
             val song = vm.activeSong
@@ -169,7 +195,18 @@ fun StudioScreen(vm: StudioViewModel) {
                 Prompter(vm, song.lines, Modifier.align(Alignment.BottomCenter).padding(bottom = 178.dp, start = 12.dp, end = 12.dp))
             }
 
-            BottomControls(vm, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 16.dp))
+            Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 16.dp)) {
+                if (vm.trackLoaded || vm.trackLoading) TrackBar(vm, onPick = { pickTrack.launch(arrayOf("audio/*")) })
+                Spacer(Modifier.height(8.dp))
+                BottomControls(vm, onTakes = { showTakes = true })
+            }
+            vm.reviewTake?.let { take ->
+                ReviewCard(
+                    vm, take,
+                    Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 128.dp, start = 12.dp, end = 12.dp),
+                    onPlay = { playTake(context, take) },
+                )
+            }
         }
 
         AnimatedVisibility(vm.exporting, enter = fadeIn(), exit = fadeOut(), modifier = Modifier.fillMaxSize()) {
@@ -179,8 +216,10 @@ fun StudioScreen(vm: StudioViewModel) {
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 120.dp))
     }
 
-    if (showSettings) SettingsSheet(vm) { showSettings = false }
+    if (showSettings) SettingsSheet(vm, onPickTrack = { pickTrack.launch(arrayOf("audio/*")) }) { showSettings = false }
     if (showLyrics) LyricsSheet(vm) { showLyrics = false }
+    if (showFx) FxSheet(vm) { showFx = false }
+    if (showTakes) TakesSheet(vm, onPlay = { playTake(context, it) }, onShare = { shareTake(context, it) }) { showTakes = false }
 }
 
 @Composable
@@ -220,7 +259,7 @@ private fun Pill(modifier: Modifier = Modifier, onClick: (() -> Unit)? = null, c
 }
 
 @Composable
-private fun TopBar(vm: StudioViewModel, onSettings: () -> Unit, onLyrics: () -> Unit) {
+private fun TopBar(vm: StudioViewModel, onSettings: () -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         val r = vm.route
         Pill(onClick = onSettings) {
@@ -239,8 +278,6 @@ private fun TopBar(vm: StudioViewModel, onSettings: () -> Unit, onLyrics: () -> 
             Text(keyText, color = Hc.Text, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1)
         }
         Spacer(Modifier.weight(1f))
-        RoundIcon(Icons.Rounded.MusicNote, "Lyrics", onLyrics)
-        Spacer(Modifier.width(8.dp))
         RoundIcon(Icons.Rounded.Tune, "Settings", onSettings)
     }
 }
@@ -360,10 +397,13 @@ private fun SmallIcon(icon: ImageVector, onClick: () -> Unit) {
 }
 
 @Composable
-private fun BottomControls(vm: StudioViewModel, modifier: Modifier) {
+private fun BottomControls(vm: StudioViewModel, onTakes: () -> Unit) {
     val s = vm.settings
-    val context = LocalContext.current
-    Column(modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        if (s.effectsOff) {
+            Pill { Text("All sound effects off · plain recording", color = Hc.Warn, fontSize = 12.sp, fontWeight = FontWeight.Medium) }
+            Spacer(Modifier.height(6.dp))
+        }
         if (s.gestures) {
             val g = vm.gesture
             val hint = if (g.voiceHand == null) "✋ Show your hand: fingers = voices · height = harmony · fist = mute · left-hand pinch = reverb"
@@ -378,17 +418,15 @@ private fun BottomControls(vm: StudioViewModel, modifier: Modifier) {
         }
         Spacer(Modifier.height(12.dp))
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceEvenly) {
-            val last = vm.lastVideo
-            RoundIcon(Icons.Rounded.Share, "Share last video", onClick = {
-                if (last != null) {
-                    val send = Intent(Intent.ACTION_SEND).apply {
-                        type = "video/mp4"
-                        putExtra(Intent.EXTRA_STREAM, last)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                    context.startActivity(Intent.createChooser(send, "Share video"))
-                } else vm.message = "Record a take first"
-            }, tint = if (last != null) Hc.Text else Hc.TextDim)
+            Box {
+                RoundIcon(Icons.Rounded.VideoLibrary, "Takes", onClick = onTakes, tint = if (vm.takes.isNotEmpty()) Hc.Text else Hc.TextDim)
+                if (vm.takes.isNotEmpty()) {
+                    Box(
+                        Modifier.align(Alignment.TopEnd).offset(x = 4.dp, y = (-4).dp).size(18.dp).clip(CircleShape).background(Hc.Accent2),
+                        contentAlignment = Alignment.Center
+                    ) { Text("${vm.takes.size}", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+                }
+            }
             RecordButton(vm.recording, vm.meters.recSeconds) { vm.toggleRecording() }
             RoundIcon(Icons.Rounded.AutoAwesome, "Visual style", onClick = {
                 val all = VisualStyle.entries
@@ -468,4 +506,115 @@ private fun ExportOverlay(progress: Float, label: String) {
             Text("Studio-quality harmonies are rendered after each take", color = Hc.TextDim, fontSize = 12.sp)
         }
     }
+}
+
+
+@Composable
+private fun SideTools(
+    vm: StudioViewModel,
+    modifier: Modifier,
+    onTrack: () -> Unit,
+    onPickTrack: () -> Unit,
+    onLyrics: () -> Unit,
+    onFx: () -> Unit,
+) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        ToolButton(Icons.Rounded.LibraryMusic, "Track", active = vm.trackLoaded, onClick = if (vm.trackLoaded) onPickTrack else onTrack)
+        ToolButton(Icons.Rounded.Article, "Lyrics", active = vm.activeSong != null, onClick = onLyrics)
+        val fxActive = !vm.settings.effectsOff && (vm.settings.correction > 0f || vm.settings.doubler > 0f || vm.settings.echo > 0f)
+        ToolButton(Icons.Rounded.GraphicEq, if (vm.settings.effectsOff) "FX off" else "FX", active = fxActive, warn = vm.settings.effectsOff, onClick = onFx)
+    }
+}
+
+@Composable
+private fun ToolButton(icon: ImageVector, label: String, active: Boolean, warn: Boolean = false, onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        val tint = when { warn -> Hc.Warn; active -> Hc.Accent; else -> Hc.Text }
+        RoundIcon(icon, label, onClick, tint = tint)
+        Text(label, color = Hc.TextDim, fontSize = 10.sp)
+    }
+}
+
+@Composable
+private fun TrackBar(vm: StudioViewModel, onPick: () -> Unit) {
+    val m = vm.meters
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp).clip(RoundedCornerShape(16.dp)).background(Hc.PanelSoft)
+            .border(1.dp, Hc.Line, RoundedCornerShape(16.dp)).padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Rounded.LibraryMusic, null, tint = Hc.Accent, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f).clickable(onClick = onPick)) {
+                Text(
+                    if (vm.trackLoading) "Loading track…" else vm.settings.trackName ?: "Backing track",
+                    color = Hc.Text, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    if (vm.recording) "Playing with your take" else "${fmt(m.trackPos)} / ${fmt(m.trackLength)}" +
+                        (vm.trackKey?.let { " · ${Notes.key(it.first, it.second)}" } ?: ""),
+                    color = Hc.TextDim, fontSize = 11.sp
+                )
+            }
+            if (!vm.trackLoading && !vm.recording) {
+                SmallIcon(Icons.Rounded.Replay) { vm.restartTrack() }
+                SmallIcon(if (m.trackPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow) { vm.toggleTrackPlayback() }
+                SmallIcon(Icons.Rounded.Close) { vm.removeTrack() }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        val p = if (vm.trackLoading) vm.trackLoadProgress else if (m.trackLength > 0) (m.trackPos / m.trackLength).coerceIn(0f, 1f) else 0f
+        LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth().height(3.dp), color = Hc.Accent, trackColor = Color(0x33FFFFFF))
+    }
+}
+
+private fun fmt(sec: Float): String {
+    val s = sec.toInt().coerceAtLeast(0)
+    return "%d:%02d".format(s / 60, s % 60)
+}
+
+@Composable
+private fun ReviewCard(vm: StudioViewModel, take: Take, modifier: Modifier, onPlay: () -> Unit) {
+    Column(
+        modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Hc.Panel).border(1.dp, Hc.Line, RoundedCornerShape(20.dp)).padding(14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Take ${take.number} ready", color = Hc.Text, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            Text(fmt(take.durationSec.toFloat()), color = Hc.TextDim, fontSize = 12.sp)
+            SmallIcon(Icons.Rounded.Close) { vm.reviewTake = null }
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onPlay, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Rounded.PlayArrow, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(4.dp)); Text("Play")
+            }
+            Button(onClick = { vm.saveTake(take) }, enabled = !take.saved, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Rounded.SaveAlt, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(4.dp)); Text(if (take.saved) "Saved" else "Save")
+            }
+            OutlinedButton(onClick = { vm.retake() }, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Rounded.Replay, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(4.dp)); Text("Retake")
+            }
+        }
+        Text("Retake discards this one. Close to keep it in Takes.", color = Hc.TextDim, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp))
+    }
+}
+
+private fun takeUri(context: android.content.Context, take: Take) =
+    FileProvider.getUriForFile(context, context.packageName + ".files", take.file)
+
+fun playTake(context: android.content.Context, take: Take) {
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(takeUri(context, take), "video/mp4")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    try { context.startActivity(intent) } catch (_: Exception) {}
+}
+
+fun shareTake(context: android.content.Context, take: Take) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "video/mp4"
+        putExtra(Intent.EXTRA_STREAM, takeUri(context, take))
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(send, "Share take"))
 }

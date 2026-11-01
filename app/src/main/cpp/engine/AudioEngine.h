@@ -13,6 +13,9 @@
 
 #include "../dsp/Harmonizer.h"
 #include "../dsp/WavIO.h"
+#include "../dsp/BackingTrack.h"
+#include <memory>
+#include <vector>
 
 namespace hc {
 
@@ -21,6 +24,7 @@ enum MeterIndex {
     kMeterVoiceMidi0, kMeterVoiceMidi1, kMeterVoiceMidi2, kMeterVoiceMidi3,
     kMeterEnv0, kMeterEnv1, kMeterEnv2, kMeterEnv3,
     kMeterOutPeak, kMeterXruns, kMeterRecSeconds, kMeterMidi, kMeterInputPeak, kMeterInputChannels,
+    kMeterTrackPos, kMeterTrackPlaying, kMeterTrackLength,
     kNumMeters
 };
 
@@ -48,6 +52,15 @@ public:
     bool startRecording(const std::string &wavPath, const std::string &automationPath);
     // returns {framesWritten, firstFrameMonotonicNanos}
     std::pair<int64_t, int64_t> stopRecording();
+    // Monotonic time at which backing-track sample 0 reached the headphones for the last take (0 = none).
+    int64_t lastTrackStartNs() const { return trackStartNs.load(); }
+
+    // Backing track (karaoke). Loading resamples to the engine rate; returns false on failure.
+    bool loadTrack(const std::string &path, int &keyRoot, int &keyScale, double &seconds);
+    void unloadTrack();
+    void setTrackPlaying(bool on) { if (track.load()) trackPlaying.store(on); }
+    void seekTrack(double seconds) { trackPos.store((int64_t) (seconds * sampleRate)); }
+    void setTrackGain(float g) { trackGain.store(g); }
 
     int readAsr(int16_t *dst, int maxSamples) { return (int) asrRing.read(dst, (size_t) maxSamples); }
     void getMeters(float *out, int n);
@@ -76,6 +89,8 @@ private:
     HarmonyBrain brain;
     VoiceBank bank;
     MixBus bus;
+    LeadProcessor lead;
+    std::vector<float> leadBuf;
     std::vector<float> dry, cond, L, R, asrTmpF;
     std::vector<int16_t> asrTmp;
 
@@ -94,6 +109,15 @@ private:
     SpscRing<float> recRing{1 << 19};       // ~10 s at 48 kHz
     SpscRing<Controls> autoRing{1 << 12};
     SpscRing<int16_t> asrRing{1 << 17};     // ~8 s at 16 kHz
+    std::atomic<BackingTrack *> track{nullptr};
+    std::vector<std::unique_ptr<BackingTrack>> trackStore; // owns tracks; old ones freed on next load
+    std::mutex trackMutex;
+    std::atomic<bool> trackPlaying{false};
+    std::atomic<int64_t> trackPos{0};
+    std::atomic<float> trackGain{0.7f};
+    std::atomic<int64_t> trackStartNs{0};
+    std::vector<float> TL, TR;
+
     std::thread writer;
     std::atomic<bool> writerRun{false};
     WavWriter wav;

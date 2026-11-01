@@ -1,24 +1,17 @@
 package com.harmonycam.app.record
 
-import android.content.ContentValues
 import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import android.net.Uri
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
 import com.harmonycam.app.audio.NativeEngine
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * After a take: studio re-render of the vocal + harmonies (native), AAC 320 kbps encode,
@@ -26,31 +19,42 @@ import java.util.Locale
  */
 class ExportPipeline(private val context: Context) {
 
-    data class Take(
+    class Recording(
         val dryWav: File,
         val automation: File,
         val videoOnly: File?,
         val audioStartNs: Long,
         val videoStartNs: Long,
         val fallbackControls: FloatArray,
+        val trackWav: File?,          // backing track that played during the take (null = none)
+        val trackStartNs: Long,       // when its first sample reached the headphones
+        val trackGain: Float,
+        val trackNudgeMs: Int,        // manual sync fine-tune
+        val output: File,             // where the finished take goes
     )
 
-    data class Result(val uri: Uri?, val file: File?, val error: String?)
+    data class Result(val file: File?, val error: String?)
 
-    fun export(take: Take, progress: (Float, String) -> Unit): Result {
+    fun export(take: Recording, progress: (Float, String) -> Unit): Result {
         val work = File(context.cacheDir, "exports").apply { mkdirs() }
         val mixWav = File(work, "mix.wav")
-        progress(0f, "Rendering harmonies")
+        progress(0f, "Rendering your take")
+        val rate = NativeEngine.nSampleRate().toLong()
+        val useTrack = take.trackWav != null && take.trackWav.exists() && take.trackStartNs > 0
+        // vocal sample index at which the singer heard the track's first sample
+        val trackOffset = if (useTrack) (take.trackStartNs - take.audioStartNs) * rate / 1_000_000_000L + take.trackNudgeMs * rate / 1000L else 0L
         val err = NativeEngine.nRender(
             take.dryWav.absolutePath, take.automation.absolutePath, mixWav.absolutePath,
             take.fallbackControls,
-            NativeEngine.ProgressListener { p -> progress(p * 0.7f, "Rendering harmonies"); true }
+            NativeEngine.ProgressListener { p -> progress(p * 0.7f, "Rendering your take"); true },
+            if (useTrack) take.trackWav!!.absolutePath else "",
+            trackOffset,
+            take.trackGain,
         )
-        if (err != null) return Result(null, null, "Render failed: $err")
+        if (err != null) return Result(null, "Render failed: $err")
 
         progress(0.7f, "Encoding audio")
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val out = File(work, "HarmonyCam_$stamp.mp4")
+        val out = take.output
         val audioOffsetUs = (take.audioStartNs - take.videoStartNs) / 1000L
         try {
             val audio = encodeAac(mixWav, audioOffsetUs) { p -> progress(0.7f + 0.2f * p, "Encoding audio") }
@@ -58,13 +62,12 @@ class ExportPipeline(private val context: Context) {
             mux(take.videoOnly, audio, out)
         } catch (e: Exception) {
             Log.e(TAG, "export failed", e)
-            return Result(null, null, "Export failed: ${e.message}")
+            out.delete()
+            return Result(null, "Export failed: ${e.message}")
         }
-        val uri = saveToGallery(out, "HarmonyCam_$stamp.mp4")
-        progress(1f, "Saved")
+        progress(1f, "Done")
         mixWav.delete()
-        take.dryWav.delete(); take.automation.delete(); take.videoOnly?.delete()
-        return Result(uri, out, null)
+        return Result(out, null)
     }
 
     private class EncodedAudio(val format: MediaFormat, val samples: List<Pair<ByteArray, MediaCodec.BufferInfo>>)
@@ -223,26 +226,6 @@ class ExportPipeline(private val context: Context) {
         }
         muxer.stop(); muxer.release()
         extractor?.release()
-    }
-
-    private fun saveToGallery(file: File, name: String): Uri? = try {
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/HarmonyCam")
-            put(MediaStore.Video.Media.IS_PENDING, 1)
-        }
-        val resolver = context.contentResolver
-        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-        if (uri != null) {
-            resolver.openOutputStream(uri)?.use { os -> file.inputStream().use { it.copyTo(os) } }
-            values.clear()
-            values.put(MediaStore.Video.Media.IS_PENDING, 0)
-            resolver.update(uri, values, null, null)
-        }
-        uri
-    } catch (e: Exception) {
-        Log.e(TAG, "gallery save failed", e); null
     }
 
     private companion object { const val TAG = "ExportPipeline" }

@@ -2,7 +2,6 @@ package com.harmonycam.app
 
 import android.app.Application
 import android.net.Uri
-import android.os.SystemClock
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -14,6 +13,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.harmonycam.app.audio.AudioRouting
 import com.harmonycam.app.audio.NativeEngine
+import com.harmonycam.app.audio.TrackDecoder
 import com.harmonycam.app.camera.CameraController
 import com.harmonycam.app.gesture.GestureInterpreter
 import com.harmonycam.app.gesture.HandTracker
@@ -23,6 +23,8 @@ import com.harmonycam.app.lyrics.LyricsStore
 import com.harmonycam.app.lyrics.LyricsTracker
 import com.harmonycam.app.lyrics.Song
 import com.harmonycam.app.record.ExportPipeline
+import com.harmonycam.app.record.Take
+import com.harmonycam.app.record.TakesStore
 import com.harmonycam.app.record.VideoEncoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -44,6 +46,9 @@ data class Meters(
     val voiceEnv: FloatArray = FloatArray(4),
     val inputPeak: Float = 0f,
     val recSeconds: Float = 0f,
+    val trackPos: Float = 0f,
+    val trackPlaying: Boolean = false,
+    val trackLength: Float = 0f,
 )
 
 class StudioViewModel(app: Application) : AndroidViewModel(app) {
@@ -67,10 +72,19 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     var exporting by mutableStateOf(false); private set
     var exportProgress by mutableFloatStateOf(0f); private set
     var exportLabel by mutableStateOf(""); private set
-    var lastVideo by mutableStateOf<Uri?>(null); private set
     var message by mutableStateOf<String?>(null)
 
+    var takes by mutableStateOf<List<Take>>(emptyList()); private set
+    /** The take just finished — shown in the review card (Play / Save / Retake). */
+    var reviewTake by mutableStateOf<Take?>(null)
+
+    var trackLoaded by mutableStateOf(false); private set
+    var trackLoading by mutableStateOf(false); private set
+    var trackLoadProgress by mutableFloatStateOf(0f); private set
+    var trackKey by mutableStateOf<Pair<Int, Boolean>?>(null); private set
+
     private val store = LyricsStore(ctx)
+    private val takesStore = TakesStore(ctx)
     private val interpreter = GestureInterpreter()
     private val camera = CameraController(ctx)
     private val exportPipeline = ExportPipeline(ctx)
@@ -80,6 +94,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private val routing = AudioRouting(ctx) { r -> onRouteChanged(r) }
     private var meterJob: Job? = null
     private var started = false
+    private var owner: LifecycleOwner? = null
+    private val trackFile = File(ctx.filesDir, "track/current.wav")
 
     // snapshot for the GL thread
     @Volatile private var visualHands: Pair<FloatArray?, FloatArray?> = null to null
@@ -95,6 +111,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         songs = store.load()
+        takes = takesStore.list()
         lyrics.onUpdate = { line, word -> lyricLine = line; lyricWord = word }
         lyrics.onStatus = { s, err ->
             viewModelScope.launch(Dispatchers.Main) {
@@ -115,8 +132,6 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         r.inputProvider = { input -> fillVisuals(input) }
         r.onSurfaceTextureRecreated = { rebindCamera() }
     }
-
-    private var owner: LifecycleOwner? = null
 
     private fun rebindCamera() {
         val o = owner ?: return
@@ -140,12 +155,14 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         }
         meterJob = viewModelScope.launch { pollMeters() }
         activeSong?.let { startLyrics(it, lyricLine) }
+        if (!trackLoaded && trackFile.exists()) reloadTrack()
     }
 
     fun onStop() {
         if (!started) return
         started = false
         if (recording) stopRecording()
+        NativeEngine.nSetTrackPlaying(false)
         meterJob?.cancel()
         lyrics.stop()
         camera.unbind()
@@ -168,11 +185,11 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         NativeEngine.nSetInputGainDb(settings.inputGainDb)
         pushControls()
         applyMonitor()
-        if (!NativeEngine.nStart()) {
-            engineError = "Couldn't open the microphone/audio output. Check the mic permission and that no other app is using it."
-        } else {
-            engineError = null
-        }
+        engineError = if (!NativeEngine.nStart())
+            "Couldn't open the microphone/audio output. Check the mic permission and that no other app is using it."
+        else null
+        // the engine's sample rate may have changed with the device: reload the track at the new rate
+        if (trackLoaded && trackFile.exists()) reloadTrack(quiet = true)
     }
 
     private fun onRouteChanged(r: AudioRouting.Route) {
@@ -187,10 +204,17 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private val canMonitor get() = (route?.canMonitor == true) || settings.speakerMonitor
+
     private fun applyMonitor() {
-        val r = route
-        val canMonitor = (r?.canMonitor == true) || settings.speakerMonitor
         NativeEngine.nSetMonitorGain(if (canMonitor) settings.monitorLevel else 0f)
+        NativeEngine.nSetTrackGain(settings.trackLevel)
+    }
+
+    private fun effectiveVoices(gestureVoices: Int): Int = when {
+        !settings.harmoniesOn || settings.effectsOff -> 0
+        settings.gestures -> gestureVoices
+        else -> settings.manualVoices
     }
 
     private fun pushControls() {
@@ -203,14 +227,18 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         NativeEngine.nSetControl(NativeEngine.C_TIGHTNESS, s.tightness)
         NativeEngine.nSetControl(NativeEngine.C_REVERB, s.reverb)
         NativeEngine.nSetControl(NativeEngine.C_WIDTH, s.width)
+        NativeEngine.nSetControl(NativeEngine.C_CORRECTION, s.correction)
+        NativeEngine.nSetControl(NativeEngine.C_RETUNE, s.retune)
+        NativeEngine.nSetControl(NativeEngine.C_DOUBLER, s.doubler)
+        NativeEngine.nSetControl(NativeEngine.C_ECHO, s.echo)
+        NativeEngine.nSetControl(NativeEngine.C_BYPASS, if (s.effectsOff) 1f else 0f)
+        val g = gesture
+        NativeEngine.nSetControl(NativeEngine.C_VOICES, effectiveVoices(g.voices).toFloat())
         if (!s.gestures) {
-            NativeEngine.nSetControl(NativeEngine.C_VOICES, s.manualVoices.toFloat())
             NativeEngine.nSetControl(NativeEngine.C_HEIGHT, s.manualHeight)
             NativeEngine.nSetControl(NativeEngine.C_MUTE, 0f)
             NativeEngine.nSetControl(NativeEngine.C_FX, s.manualFx)
         } else {
-            val g = gesture
-            NativeEngine.nSetControl(NativeEngine.C_VOICES, g.voices.toFloat())
             NativeEngine.nSetControl(NativeEngine.C_HEIGHT, g.height)
             NativeEngine.nSetControl(NativeEngine.C_MUTE, if (g.mute) 1f else 0f)
             NativeEngine.nSetControl(NativeEngine.C_FX, g.fx)
@@ -251,11 +279,84 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
                 voiceEnv = FloatArray(4) { buf[NativeEngine.M_ENV0 + it] },
                 inputPeak = buf[NativeEngine.M_INPUT_PEAK],
                 recSeconds = buf[NativeEngine.M_REC_SECONDS],
+                trackPos = buf[NativeEngine.M_TRACK_POS],
+                trackPlaying = buf[NativeEngine.M_TRACK_PLAYING] > 0.5f,
+                trackLength = buf[NativeEngine.M_TRACK_LENGTH],
             )
             meters = m
             visualMeters = m
             delay(33)
         }
+    }
+
+    // ───────────────────────── backing track (karaoke)
+
+    fun pickTrack(uri: Uri) {
+        if (recording) { message = "Stop recording first"; return }
+        trackLoading = true
+        trackLoadProgress = 0f
+        viewModelScope.launch(Dispatchers.Default) {
+            val name = TrackDecoder.displayName(ctx, uri)
+            val tmp = File(ctx.cacheDir, "track_decode.wav")
+            val ok = try {
+                TrackDecoder.decode(ctx, uri, tmp) { p -> viewModelScope.launch(Dispatchers.Main) { trackLoadProgress = p * 0.8f } }
+            } catch (e: Exception) {
+                Log.e("Studio", "decode", e); false
+            }
+            if (!ok) {
+                withContext(Dispatchers.Main) { trackLoading = false; message = "Couldn't read that audio file" }
+                return@launch
+            }
+            trackFile.parentFile?.mkdirs()
+            tmp.copyTo(trackFile, overwrite = true)
+            tmp.delete()
+            val info = NativeEngine.nLoadTrack(trackFile.absolutePath)
+            withContext(Dispatchers.Main) {
+                trackLoading = false
+                if (info == null) { message = "Couldn't load the track"; return@withContext }
+                trackLoaded = true
+                val key = info[1].toInt() to (info[2].toInt() == 1)
+                trackKey = key
+                updateSettings { it.copy(trackName = name) }
+                if (settings.trackSetsKey) {
+                    updateSettings { it.copy(keyRoot = key.first, minor = key.second) }
+                    message = "“$name” loaded · key set to ${Notes.key(key.first, key.second)}"
+                } else {
+                    message = "“$name” loaded · sounds like ${Notes.key(key.first, key.second)}"
+                }
+                if (!canMonitor) message = "Track loaded — plug in headphones or your interface to hear it"
+            }
+        }
+    }
+
+    private fun reloadTrack(quiet: Boolean = false) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val info = NativeEngine.nLoadTrack(trackFile.absolutePath)
+            withContext(Dispatchers.Main) {
+                trackLoaded = info != null
+                if (info != null) trackKey = info[1].toInt() to (info[2].toInt() == 1)
+                else if (!quiet) message = "Couldn't reload the backing track"
+            }
+        }
+    }
+
+    fun toggleTrackPlayback() {
+        if (!trackLoaded || recording) return
+        if (!canMonitor) { message = "Plug in headphones or your interface to play the track (it would leak into the mic)"; return }
+        val m = meters
+        if (!m.trackPlaying && m.trackLength > 0 && m.trackPos >= m.trackLength - 0.1f) NativeEngine.nSeekTrack(0f)
+        NativeEngine.nSetTrackPlaying(!m.trackPlaying)
+    }
+
+    fun restartTrack() { NativeEngine.nSeekTrack(0f) }
+
+    fun removeTrack() {
+        if (recording) return
+        NativeEngine.nUnloadTrack()
+        trackFile.delete()
+        trackLoaded = false
+        trackKey = null
+        updateSettings { it.copy(trackName = null) }
     }
 
     // ───────────────────────── gestures & visuals
@@ -264,7 +365,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         val s = settings
         val g = interpreter.update(hands, s.swapHands, s.holdWhenLost, timeMs)
         if (s.gestures) {
-            NativeEngine.nSetControl(NativeEngine.C_VOICES, g.voices.toFloat())
+            NativeEngine.nSetControl(NativeEngine.C_VOICES, effectiveVoices(g.voices).toFloat())
             NativeEngine.nSetControl(NativeEngine.C_HEIGHT, g.height)
             NativeEngine.nSetControl(NativeEngine.C_MUTE, if (g.mute) 1f else 0f)
             NativeEngine.nSetControl(NativeEngine.C_FX, g.fx)
@@ -305,13 +406,15 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         for (i in 0 until 4) { input.voiceMidi[i] = m.voiceMidi[i]; input.voiceEnv[i] = m.voiceEnv[i] }
     }
 
-    // ───────────────────────── recording
+    // ───────────────────────── recording & takes
 
     fun toggleRecording() { if (recording) stopRecording() else startRecording() }
 
     private fun startRecording() {
-        if (exporting) return
+        if (exporting) { message = "Still finishing the last take…"; return }
         if (!NativeEngine.nIsRunning()) { message = "Audio engine isn't running"; return }
+        if (trackLoaded && !canMonitor) message = "No headphones — the backing track won't be heard live"
+        reviewTake = null
         val dir = File(ctx.cacheDir, "take_${System.currentTimeMillis()}").apply { mkdirs() }
         takeDir = dir
         val enc = VideoEncoder.create(File(dir, "video.mp4"))
@@ -325,8 +428,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         encoder = enc
         if (enc != null) renderer?.startRecording(enc, recordStartNs)
         recording = true
-        // restart lyrics from the top line the singer is on
-        activeSong?.let { lyrics.jumpTo(lyricLine) }
+        // each take starts the lyrics from the top
+        if (activeSong != null) lyrics.jumpTo(0)
     }
 
     private fun stopRecording() {
@@ -334,48 +437,93 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         recording = false
         val res = NativeEngine.nStopRecording()
         val audioStartNs = res[1]
+        val trackStartNs = if (res.size > 3) res[3] else 0L
         val dir = takeDir ?: return
         val enc = encoder
         encoder = null
-        val controls = currentControlsArray()
+        val s = settings
+        val rec = ExportPipeline.Recording(
+            dryWav = File(dir, "vocal.wav"),
+            automation = File(dir, "automation.bin"),
+            videoOnly = null,
+            audioStartNs = audioStartNs,
+            videoStartNs = recordStartNs,
+            fallbackControls = currentControlsArray(),
+            trackWav = if (trackLoaded) trackFile else null,
+            trackStartNs = trackStartNs,
+            trackGain = s.trackLevel,
+            trackNudgeMs = s.trackNudgeMs,
+            output = takesStore.newFile(),
+        )
         val finishVideo: () -> Unit = {
             viewModelScope.launch(Dispatchers.Default) {
                 val video = enc?.finish()
-                export(ExportPipeline.Take(File(dir, "vocal.wav"), File(dir, "automation.bin"), video, audioStartNs, recordStartNs, controls), dir)
+                export(rec.withVideo(video), dir)
             }
         }
         val r = renderer
         if (enc != null && r != null) r.stopRecording { finishVideo() } else finishVideo()
     }
 
+    private fun ExportPipeline.Recording.withVideo(v: File?) = ExportPipeline.Recording(
+        dryWav, automation, v, audioStartNs, videoStartNs, fallbackControls, trackWav, trackStartNs, trackGain, trackNudgeMs, output
+    )
+
     private fun currentControlsArray(): FloatArray {
         val s = settings; val g = gesture
         return floatArrayOf(
-            if (s.gestures) g.voices.toFloat() else s.manualVoices.toFloat(),
+            effectiveVoices(g.voices).toFloat(),
             if (s.gestures) g.height else s.manualHeight,
             if (s.gestures && g.mute) 1f else 0f,
             if (s.gestures) g.fx else s.manualFx,
             s.keyRoot.toFloat(), if (s.minor) 1f else 0f, s.harmonyLevel, s.leadLevel,
-            s.humanize, s.tightness, s.reverb, s.width
+            s.humanize, s.tightness, s.reverb, s.width,
+            s.correction, s.retune, s.doubler, s.echo, if (s.effectsOff) 1f else 0f,
         )
     }
 
-    private suspend fun export(take: ExportPipeline.Take, dir: File) {
-        withContext(Dispatchers.Main) { exporting = true; exportProgress = 0f; exportLabel = "Rendering harmonies" }
+    private suspend fun export(rec: ExportPipeline.Recording, dir: File) {
+        withContext(Dispatchers.Main) { exporting = true; exportProgress = 0f; exportLabel = "Rendering your take" }
         val result = try {
-            exportPipeline.export(take) { p, label ->
+            exportPipeline.export(rec) { p, label ->
                 viewModelScope.launch(Dispatchers.Main) { exportProgress = p; exportLabel = label }
             }
         } catch (e: Exception) {
             Log.e("Studio", "export", e)
-            ExportPipeline.Result(null, null, e.message)
+            ExportPipeline.Result(null, e.message)
         }
         dir.deleteRecursively()
         withContext(Dispatchers.Main) {
             exporting = false
+            takes = takesStore.list()
             if (result.error != null) message = result.error
-            else { lastVideo = result.uri; message = "Saved to Gallery › Movies/HarmonyCam" }
+            else reviewTake = takes.firstOrNull { it.file == result.file }
         }
+    }
+
+    fun saveTake(take: Take) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val uri = takesStore.saveToGallery(take)
+            withContext(Dispatchers.Main) {
+                takes = takesStore.list()
+                if (reviewTake?.file == take.file) reviewTake = takes.firstOrNull { it.file == take.file }
+                message = if (uri != null) "Saved to Gallery › Movies/HarmonyCam" else "Couldn't save to Gallery"
+            }
+        }
+    }
+
+    fun deleteTake(take: Take) {
+        takesStore.delete(take)
+        takes = takesStore.list()
+        if (reviewTake?.file == take.file) reviewTake = null
+    }
+
+    /** Discard the take under review and get ready to record again. */
+    fun retake() {
+        reviewTake?.let { deleteTake(it) }
+        reviewTake = null
+        if (trackLoaded) restartTrack()
+        if (activeSong != null) lyrics.jumpTo(0)
     }
 
     // ───────────────────────── lyrics
@@ -408,7 +556,4 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     fun previousLine() = lyrics.jumpTo((lyricLine - 1).coerceAtLeast(0))
 
     fun restartLyrics() = lyrics.jumpTo(0)
-
-    @Suppress("unused")
-    private val bootTime = SystemClock.uptimeMillis()
 }

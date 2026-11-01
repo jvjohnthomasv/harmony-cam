@@ -109,10 +109,35 @@ int main() {
         for (size_t i=0;i<dry.size();++i) if (std::fabs(dry[i])>0.01f){b=i;break;}
         printf("harmony onset %ld vs dry %ld => lag %.1f ms (expected ~%.1f ms humanize floor)\n", a, b, (a-b)*1000.0/sr, 14*0.35);
     }
+    // pitch correction: singer 0.4 st flat; hard correction should land on the note
+    {
+        std::vector<std::pair<float,float>> mel2 = {{0,0.3f},{60,1.0f},{64,1.0f},{67,1.0f},{0,0.3f}};
+        auto flat = synthVoice(sr, mel2, -0.4f);
+        writeMono("/tmp/hc_flat.wav", flat, sr);
+        for (float corr : {0.0f, 1.0f}) {
+            Controls cc = c; cc.voices = 0; cc.dryLevel = 1; cc.correction = corr; cc.retune = 0.1f;
+            writeAutomation("/tmp/hc_auto.bin", cc, flat.size(), 480);
+            renderPerformance("/tmp/hc_flat.wav", "/tmp/hc_auto.bin", "/tmp/hc_out.wav", cc, nullptr);
+            float tcur = 0.3f; float worst = 0;
+            for (int k = 1; k <= 3; ++k) { float m = measure("/tmp/hc_out.wav", tcur + 0.3f, tcur + 0.9f); worst = std::max(worst, std::fabs(m - mel2[k].first)); tcur += 1.0f; }
+            printf("pitch correction %.0f%%: worst error %.2f semitones\n", corr * 100, worst);
+            if (corr > 0 && worst > 0.12f) { failures++; printf("   FAIL\n"); }
+            if (corr == 0 && worst < 0.3f) { failures++; printf("   FAIL (should be uncorrected)\n"); }
+        }
+        // bypass: output equals the raw input
+        Controls cb = c; cb.bypass = 1;
+        writeAutomation("/tmp/hc_auto.bin", cb, flat.size(), 480);
+        renderPerformance("/tmp/hc_flat.wav", "/tmp/hc_auto.bin", "/tmp/hc_out.wav", cb, nullptr);
+        WavReader r; r.open("/tmp/hc_out.wav"); std::vector<float> x(r.frames()); r.readMono(x.data(), x.size());
+        double err = 0; for (size_t i = 0; i < flat.size() && i < x.size(); ++i) err = std::max(err, (double) std::fabs(x[i] - flat[i]));
+        printf("bypass: max difference from raw input %.6f\n", err);
+        if (err > 1e-4) { failures++; printf("   FAIL\n"); }
+    }
     // realtime CPU estimate: 4 voices, realtime config
     {
         VoiceBank bank; bank.setup(sr, VoiceBank::Realtime); HarmonyBrain brain; brain.setup(sr); MixBus bus; bus.setup(sr, false);
-        Controls cc; cc.voices = 4; cc.keyRoot = 0;
+        LeadProcessor lp; lp.setup(sr, false); std::vector<float> lb(192);
+        Controls cc; cc.voices = 4; cc.keyRoot = 0; cc.correction = 0.8f; cc.doubler = 0.5f; cc.echo = 0.4f;
         std::vector<float> L(192), R(192), buf(192);
         auto t0 = std::chrono::steady_clock::now();
         size_t n = 0;
@@ -124,7 +149,8 @@ int main() {
             auto tg = brain.targets(brain.state(), cc);
             std::fill(L.begin(), L.end(), 0.f); std::fill(R.begin(), R.end(), 0.f);
             bank.process(buf.data(), 192, tg, cc, brain.state().f0, L.data(), R.data());
-            bus.mix(buf.data(), L.data(), R.data(), 192, cc);
+            lp.process(buf.data(), 192, brain.state(), cc, lb.data(), L.data(), R.data());
+            bus.mix(lb.data(), L.data(), R.data(), 192, cc);
             n += 192;
         }
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

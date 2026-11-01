@@ -68,16 +68,32 @@ JNIEXPORT jboolean JNICALL FN(nStartRecording)(JNIEnv *env, jobject, jstring wav
 
 JNIEXPORT jlongArray JNICALL FN(nStopRecording)(JNIEnv *env, jobject) {
     auto r = engine().stopRecording();
-    jlong vals[3] = {r.first, r.second, engine().getSampleRate()};
-    jlongArray arr = env->NewLongArray(3);
-    env->SetLongArrayRegion(arr, 0, 3, vals);
+    jlong vals[4] = {r.first, r.second, engine().getSampleRate(), engine().lastTrackStartNs()};
+    jlongArray arr = env->NewLongArray(4);
+    env->SetLongArrayRegion(arr, 0, 4, vals);
     return arr;
 }
+
+// Returns [seconds, keyRoot, keyScale] or null on failure.
+JNIEXPORT jfloatArray JNICALL FN(nLoadTrack)(JNIEnv *env, jobject, jstring path) {
+    int root = 0, scale = 0; double secs = 0;
+    if (!engine().loadTrack(toString(env, path), root, scale, secs)) return nullptr;
+    jfloat vals[3] = {(jfloat) secs, (jfloat) root, (jfloat) scale};
+    jfloatArray arr = env->NewFloatArray(3);
+    env->SetFloatArrayRegion(arr, 0, 3, vals);
+    return arr;
+}
+
+JNIEXPORT void JNICALL FN(nUnloadTrack)(JNIEnv *, jobject) { engine().unloadTrack(); }
+JNIEXPORT void JNICALL FN(nSetTrackPlaying)(JNIEnv *, jobject, jboolean on) { engine().setTrackPlaying(on == JNI_TRUE); }
+JNIEXPORT void JNICALL FN(nSeekTrack)(JNIEnv *, jobject, jfloat seconds) { engine().seekTrack(seconds); }
+JNIEXPORT void JNICALL FN(nSetTrackGain)(JNIEnv *, jobject, jfloat gain) { engine().setTrackGain(gain); }
 
 // Renders the final mix. listener: object with `boolean onProgress(float)`; returning false cancels.
 // Returns null on success, or an error message.
 JNIEXPORT jstring JNICALL FN(nRender)(JNIEnv *env, jobject, jstring dryWav, jstring automation, jstring outWav,
-                                      jfloatArray fallbackControls, jobject listener) {
+                                      jfloatArray fallbackControls, jobject listener,
+                                      jstring trackPath, jlong trackOffsetSamples, jfloat trackGain) {
     Controls fb;
     if (fallbackControls && env->GetArrayLength(fallbackControls) >= kNumControls)
         env->GetFloatArrayRegion(fallbackControls, 0, kNumControls, reinterpret_cast<float *>(&fb));
@@ -92,7 +108,8 @@ JNIEXPORT jstring JNICALL FN(nRender)(JNIEnv *env, jobject, jstring dryWav, jstr
         if (env->ExceptionCheck()) { env->ExceptionClear(); return true; }
         return keep == JNI_TRUE;
     };
-    RenderResult res = renderPerformance(toString(env, dryWav), toString(env, automation), toString(env, outWav), fb, progress);
+    RenderResult res = renderPerformance(toString(env, dryWav), toString(env, automation), toString(env, outWav), fb, progress,
+                                         toString(env, trackPath), (long) trackOffsetSamples, trackGain);
     if (res.ok) return nullptr;
     return env->NewStringUTF(res.error.c_str());
 }

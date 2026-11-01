@@ -26,6 +26,18 @@ data class StudioSettings(
     val manualVoices: Int = 2,
     val manualHeight: Float = 0.5f,
     val manualFx: Float = 0.3f,
+    // sound FX
+    val effectsOff: Boolean = false,  // plain recording: no harmonies, tuning, reverb, compression…
+    val harmoniesOn: Boolean = true,
+    val correction: Float = 0f,
+    val retune: Float = 0.5f,
+    val doubler: Float = 0f,
+    val echo: Float = 0f,
+    // backing track
+    val trackLevel: Float = 0.7f,
+    val trackNudgeMs: Int = 0,
+    val trackSetsKey: Boolean = true,
+    val trackName: String? = null,
 ) {
     companion object {
         private const val PREFS = "studio"
@@ -56,6 +68,16 @@ data class StudioSettings(
                 manualVoices = p.getInt("manualVoices", d.manualVoices),
                 manualHeight = p.getFloat("manualHeight", d.manualHeight),
                 manualFx = p.getFloat("manualFx", d.manualFx),
+                effectsOff = p.getBoolean("effectsOff", d.effectsOff),
+                harmoniesOn = p.getBoolean("harmoniesOn", d.harmoniesOn),
+                correction = p.getFloat("correction", d.correction),
+                retune = p.getFloat("retune", d.retune),
+                doubler = p.getFloat("doubler", d.doubler),
+                echo = p.getFloat("echo", d.echo),
+                trackLevel = p.getFloat("trackLevel", d.trackLevel),
+                trackNudgeMs = p.getInt("trackNudgeMs", d.trackNudgeMs),
+                trackSetsKey = p.getBoolean("trackSetsKey", d.trackSetsKey),
+                trackName = p.getString("trackName", null),
             )
         }
 
@@ -73,6 +95,11 @@ data class StudioSettings(
                 .putInt("camExtraRotation", s.camExtraRotation).putBoolean("camMirror", s.camMirror)
                 .putInt("manualVoices", s.manualVoices).putFloat("manualHeight", s.manualHeight)
                 .putFloat("manualFx", s.manualFx)
+                .putBoolean("effectsOff", s.effectsOff).putBoolean("harmoniesOn", s.harmoniesOn)
+                .putFloat("correction", s.correction).putFloat("retune", s.retune)
+                .putFloat("doubler", s.doubler).putFloat("echo", s.echo)
+                .putFloat("trackLevel", s.trackLevel).putInt("trackNudgeMs", s.trackNudgeMs)
+                .putBoolean("trackSetsKey", s.trackSetsKey).putString("trackName", s.trackName)
                 .apply()
         }
     }

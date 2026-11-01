@@ -40,9 +40,12 @@ void AudioEngine::prepareDsp() {
     brain.setup((float) sampleRate);
     bank.setup((float) sampleRate, VoiceBank::Realtime);
     bus.setup((float) sampleRate, false);
+    lead.setup((float) sampleRate, false);
     const int maxFrames = 8192;
+    leadBuf.assign(maxFrames, 0.0f);
     dry.assign(maxFrames, 0.0f); cond.assign(maxFrames, 0.0f);
     L.assign(maxFrames, 0.0f); R.assign(maxFrames, 0.0f);
+    TL.assign(maxFrames, 0.0f); TR.assign(maxFrames, 0.0f);
     asrTmp.assign(maxFrames, 0);
     autoHop = std::max(1, sampleRate / 100);
 }
@@ -200,9 +203,27 @@ oboe::DataCallbackResult AudioEngine::onBothStreamsReady(const void *inputData, 
         recFirstFrameNs.store(first);
         recFrames.store(0);
         autoCounter = 0;
+        // The karaoke track restarts with the take, sample-accurately in this callback.
+        trackStartNs.store(0);
+        if (track.load(std::memory_order_acquire)) {
+            trackPos.store(0);
+            trackPlaying.store(true);
+            int64_t when = 0;
+            if (outStream) {
+                auto ts = outStream->getTimestamp(CLOCK_MONOTONIC);
+                int64_t written = outStream->getFramesWritten();
+                if (ts) when = ts.value().timestamp + (written - ts.value().position) * 1000000000LL / sampleRate;
+                if (when <= 0) {
+                    auto lat = outStream->calculateLatencyMillis();
+                    when = nowNanos() + (int64_t) ((lat ? lat.value() : 20.0) * 1e6);
+                }
+            }
+            trackStartNs.store(when);
+        }
         recState.store(Recording, std::memory_order_release);
         rs = Recording;
     } else if (rs == Stopping) {
+        trackPlaying.store(false);
         recState.store(Stopped, std::memory_order_release);
         rs = Stopped;
     }
@@ -217,25 +238,47 @@ oboe::DataCallbackResult AudioEngine::onBothStreamsReady(const void *inputData, 
     }
 
     // ── harmony processing
-    std::copy(dry.begin(), dry.begin() + n, cond.begin());
-    bus.conditionDry(cond.data(), n);
     const bool asr = asrEnabled.load(std::memory_order_relaxed);
-    brain.analyze(cond.data(), n, c,
-                  [&](const float *d, int m) {
-                      if (!asr) return;
-                      for (int i = 0; i < m; ++i) {
-                          float v = clampf(d[i] * 1.6f, -1.0f, 1.0f);
-                          asrTmp[i] = (int16_t) (v * 32767.0f);
-                      }
-                      asrRing.write(asrTmp.data(), (size_t) m);
-                  },
-                  []() {});
+    auto feedAsr = [&](const float *d, int m) {
+        if (!asr) return;
+        for (int i = 0; i < m; ++i) asrTmp[i] = (int16_t) (clampf(d[i] * 1.6f, -1.0f, 1.0f) * 32767.0f);
+        asrRing.write(asrTmp.data(), (size_t) m);
+    };
+    BackingTrack *bt = track.load(std::memory_order_acquire);
+    const bool withTrack = bt && trackPlaying.load(std::memory_order_relaxed);
+    std::fill(TL.begin(), TL.begin() + n, 0.0f);
+    std::fill(TR.begin(), TR.begin() + n, 0.0f);
+    if (withTrack) {
+        int64_t pos = trackPos.load(std::memory_order_relaxed);
+        if (pos >= 0) bt->mixInto((size_t) pos, TL.data(), TR.data(), n, trackGain.load(std::memory_order_relaxed));
+        pos += n;
+        trackPos.store(pos, std::memory_order_relaxed);
+        if (pos >= (int64_t) bt->numFrames()) trackPlaying.store(false);
+    }
+
+    VoiceTargets tg;
+    const bool bypass = c.bypass > 0.5f;
+    if (bypass) {
+        // "all effects off": plain mic (+ karaoke track); keep analysing for meters & lyric tracking
+        brain.analyze(dry.data(), n, c, feedAsr, []() {});
+        for (int i = 0; i < n; ++i) {
+            L[i] = clampf(dry[i] + TL[i], -1.0f, 1.0f);
+            R[i] = clampf(dry[i] + TR[i], -1.0f, 1.0f);
+        }
+        for (int v = 0; v < kMaxVoices; ++v) { tg.active[v] = false; tg.midi[v] = 0; }
+    } else {
+        std::copy(dry.begin(), dry.begin() + n, cond.begin());
+        bus.conditionDry(cond.data(), n);
+        brain.analyze(cond.data(), n, c, feedAsr, []() {});
+        const NoteState &ns0 = brain.state();
+        tg = brain.targets(ns0, c);
+        std::fill(L.begin(), L.begin() + n, 0.0f);
+        std::fill(R.begin(), R.begin() + n, 0.0f);
+        bank.process(cond.data(), n, tg, c, ns0.voiced ? ns0.f0 : 0.0f, L.data(), R.data());
+        lead.process(cond.data(), n, ns0, c, leadBuf.data(), L.data(), R.data());
+        bus.mix(leadBuf.data(), L.data(), R.data(), n, c, TL.data(), TR.data());
+    }
     const NoteState &ns = brain.state();
-    VoiceTargets tg = brain.targets(ns, c);
-    std::fill(L.begin(), L.begin() + n, 0.0f);
-    std::fill(R.begin(), R.begin() + n, 0.0f);
-    bank.process(cond.data(), n, tg, c, ns.voiced ? ns.f0 : 0.0f, L.data(), R.data());
-    bus.mix(cond.data(), L.data(), R.data(), n, c);
 
     const float g = monitorGain.load(std::memory_order_relaxed);
     float peak = 0;
@@ -260,6 +303,14 @@ oboe::DataCallbackResult AudioEngine::onBothStreamsReady(const void *inputData, 
     }
     meters[kMeterOutPeak].store(peak, std::memory_order_relaxed);
     meters[kMeterXruns].store((float) xruns.load(), std::memory_order_relaxed);
+    if (bt) {
+        meters[kMeterTrackPos].store((float) trackPos.load(std::memory_order_relaxed) / sampleRate, std::memory_order_relaxed);
+        meters[kMeterTrackPlaying].store(trackPlaying.load(std::memory_order_relaxed) ? 1.0f : 0.0f, std::memory_order_relaxed);
+        meters[kMeterTrackLength].store((float) bt->numFrames() / sampleRate, std::memory_order_relaxed);
+    } else {
+        meters[kMeterTrackPlaying].store(0.0f, std::memory_order_relaxed);
+        meters[kMeterTrackLength].store(0.0f, std::memory_order_relaxed);
+    }
     return oboe::DataCallbackResult::Continue;
 }
 
@@ -314,6 +365,32 @@ std::pair<int64_t, int64_t> AudioEngine::stopRecording() {
     if (autoFile) { std::fclose(autoFile); autoFile = nullptr; }
     recState.store(Idle);
     return {recFrames.load(), recFirstFrameNs.load()};
+}
+
+} // namespace hc
+
+namespace hc {
+
+bool AudioEngine::loadTrack(const std::string &path, int &keyRoot, int &keyScale, double &seconds) {
+    auto t = std::make_unique<BackingTrack>();
+    if (!t->load(path, sampleRate)) return false;
+    keyRoot = t->keyRoot(); keyScale = t->keyScale();
+    seconds = (double) t->numFrames() / sampleRate;
+    std::lock_guard<std::mutex> lock(trackMutex);
+    trackPlaying.store(false);
+    trackPos.store(0);
+    track.store(t.get(), std::memory_order_release);
+    // keep the previous track alive (the audio thread may still be reading it); free older ones
+    while (trackStore.size() > 1) trackStore.erase(trackStore.begin());
+    trackStore.push_back(std::move(t));
+    return true;
+}
+
+void AudioEngine::unloadTrack() {
+    std::lock_guard<std::mutex> lock(trackMutex);
+    trackPlaying.store(false);
+    track.store(nullptr, std::memory_order_release);
+    // freed lazily on the next load, after the audio thread has long stopped touching it
 }
 
 } // namespace hc

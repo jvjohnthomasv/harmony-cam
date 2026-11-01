@@ -83,6 +83,13 @@ struct DelayLine {
     inline void write(float x) { buf[pos] = x; pos = (pos + 1) & mask; }
     // delay >= 1: sample written `delay` writes ago
     inline float read(int delay) const { return buf[(pos - (uint32_t) delay) & mask]; }
+    // fractional delay (>= 1), linear interpolation
+    inline float readFrac(float delay) const {
+        int di = (int) delay;
+        float f = delay - di;
+        float a = read(di), b = read(di + 1);
+        return a + (b - a) * f;
+    }
 };
 
 // Single-producer / single-consumer lock-free ring buffer (safe for audio thread → worker thread).

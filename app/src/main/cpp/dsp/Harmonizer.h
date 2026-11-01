@@ -29,9 +29,14 @@ struct Controls {
     float tightness = 0.6f;    // 0..1 how much harmonies correct the singer's sustained tuning offset
     float reverb = 0.35f;      // 0..1 base reverb amount (pinch adds on top)
     float width = 0.8f;        // 0..1 stereo spread of harmony voices
+    float correction = 0;      // 0..1 lead-vocal pitch correction amount
+    float retune = 0.5f;       // 0 = hard/robotic (instant) .. 1 = natural (slow, keeps vibrato)
+    float doubler = 0;         // 0..1 double-tracked lead
+    float echo = 0;            // 0..1 stereo echo
+    float bypass = 0;          // 1 = all sound effects off: plain recording
 };
-static_assert(sizeof(Controls) == 12 * sizeof(float), "Controls must be 12 floats");
-constexpr int kNumControls = 12;
+constexpr int kNumControls = 17;
+static_assert(sizeof(Controls) == kNumControls * sizeof(float), "Controls must be plain floats");
 
 struct NoteState {
     bool voiced = false;
@@ -156,7 +161,10 @@ private:
             if (!st.hasNote) {
                 st.note = candidate; st.hasNote = true; st.devSlow = clampf(mm - candidate, -0.5f, 0.5f); pending = 0;
             } else if (candidate != st.note) {
-                if (std::fabs(mm - st.note) > 0.95f || ++pending >= 3) {
+                // hysteresis: a big jump switches at once; small drifts (vibrato, a flat singer)
+                // must clearly cross into the neighbouring note and stay there for 30 ms
+                float away = std::fabs(mm - st.note);
+                if (away > 0.95f || (away > 0.7f && ++pending >= 3)) {
                     st.note = candidate; pending = 0;
                     st.devSlow = clampf(mm - candidate, -0.5f, 0.5f);
                 }
@@ -317,6 +325,116 @@ private:
     std::vector<float> tmpOut;
 };
 
+
+// ───────────────────────────── Lead vocal FX ─────────────────────────────
+// Pitch correction (formant-preserving), doubler and stereo echo for the lead vocal.
+class LeadProcessor {
+public:
+    // alignLatency (studio only): the direct path is delayed by this many samples so it lines
+    // up with the harmony voices; the corrected path is padded to the same total.
+    void setup(float sr, bool studio, int alignLatency = 0) {
+        sampleRate = sr;
+        isStudio = studio;
+        if (studio) corrector.presetDefault(1, sr);
+        else corrector.configure(1, (int) (sr * 0.021f), (int) (sr * 0.0053f), false); // ~21 ms
+        corrLatency = corrector.inputLatency() + corrector.outputLatency();
+        directDelay = studio ? alignLatency : 0;
+        corrPad = studio ? std::max(0, alignLatency - corrLatency) : 0;
+        directLine.init(std::max(directDelay, 1) + 8);
+        corrLine.init(std::max(corrPad, 1) + 8);
+        dbl.init((int) (sr * 0.06f));
+        echoL.init((int) (sr * 0.8f)); echoR.init((int) (sr * 0.8f));
+        echoToneL.setLowpass(4200, sr); echoToneR.setLowpass(4200, sr);
+        echoHpL.setHighpass(250, sr); echoHpR.setHighpass(250, sr);
+        dblTone.setLowpass(8000, sr);
+        tmp.assign(4096, 0.0f);
+        corrEnv = 0; corrShift = 0; devFiltered = 0; phase = 0; corrActive = false;
+    }
+
+    // in: conditioned lead. lead: output mono lead. L/R: doubler + echo added (stereo).
+    void process(const float *in, int n, const NoteState &ns, const Controls &c, float *lead, float *L, float *R) {
+        if (n > 4096) {
+            for (int o = 0; o < n; o += 4096) process(in + o, std::min(4096, n - o), ns, c, lead + o, L + o, R + o);
+            return;
+        }
+        const float amount = clampf(c.correction, 0, 1);
+        const float dt = n / sampleRate;
+        // ── pitch-correction target
+        if (ns.voiced && ns.hasNote) {
+            float dev = ns.midi - (float) ns.note;
+            float tau = 0.004f + clampf(c.retune, 0, 1) * 0.30f;
+            devFiltered += (dev - devFiltered) * (1.0f - std::exp(-dt / tau));
+            float target = -amount * devFiltered;
+            corrShift += (target - corrShift) * (1.0f - std::exp(-dt / std::max(0.002f, tau * 0.5f)));
+        } else {
+            corrShift *= std::exp(-dt / 0.15f);
+        }
+        const bool want = amount > 0.001f;
+        if (want && !corrActive) { corrector.reset(); corrActive = true; }
+        if (corrActive) {
+            corrector.setTransposeSemitones(corrShift);
+            corrector.setFormantSemitones(0, true);
+            if (ns.voiced && ns.f0 > 0) corrector.setFormantBase(ns.f0 / sampleRate);
+            const float *ins[1] = {in};
+            float *outs[1] = {tmp.data()};
+            corrector.process(ins, n, outs, n);
+        }
+        const float xf = smoothCoef(0.03f, sampleRate);
+        for (int i = 0; i < n; ++i) {
+            directLine.write(in[i]);
+            float direct = directDelay > 0 ? directLine.read(directDelay + 1) : in[i];
+            float corrected = 0;
+            if (corrActive) {
+                corrLine.write(tmp[i]);
+                corrected = corrPad > 0 ? corrLine.read(corrPad + 1) : tmp[i];
+            }
+            corrEnv += ((want ? 1.0f : 0.0f) - corrEnv) * xf;
+            lead[i] = direct + (corrected - direct) * corrEnv;
+        }
+        if (!want && corrEnv < 1e-4f) corrActive = false;
+
+        // ── doubler: two slowly-modulated short delays panned left/right
+        const float dblAmt = clampf(c.doubler, 0, 1);
+        const float echoAmt = clampf(c.echo, 0, 1);
+        const int echoSamples = (int) (0.34f * sampleRate);
+        for (int i = 0; i < n; ++i) {
+            float x = lead[i];
+            dbl.write(x);
+            if (dblAmt > 0.001f) {
+                phase += 1.0f / sampleRate;
+                float d1 = (0.019f + 0.0016f * std::sin(2 * kPi * 0.31f * phase)) * sampleRate;
+                float d2 = (0.027f + 0.0019f * std::sin(2 * kPi * 0.23f * phase + 1.7f)) * sampleRate;
+                float a = dblTone.process(dbl.readFrac(d1));
+                float b = dbl.readFrac(d2);
+                L[i] += a * dblAmt * 0.55f;
+                R[i] += b * dblAmt * 0.55f;
+            }
+            if (echoAmt > 0.001f) {
+                // ping-pong: left feeds right and vice versa
+                float el = echoL.read(echoSamples), er = echoR.read(echoSamples);
+                float fb = 0.38f;
+                echoL.write(echoHpL.process(echoToneL.process(x * 0.7f + er * fb)));
+                echoR.write(echoHpR.process(echoToneR.process(el * fb)));
+                L[i] += el * echoAmt * 0.6f;
+                R[i] += er * echoAmt * 0.6f;
+            } else {
+                echoL.write(0); echoR.write(0);
+            }
+        }
+    }
+
+    int latencySamples() const { return isStudio ? directDelay : 0; }
+
+private:
+    signalsmith::stretch::SignalsmithStretch<float> corrector;
+    DelayLine directLine, corrLine, dbl, echoL, echoR;
+    Biquad echoToneL, echoToneR, echoHpL, echoHpR, dblTone;
+    std::vector<float> tmp;
+    float sampleRate = 48000, corrEnv = 0, corrShift = 0, devFiltered = 0, phase = 0;
+    int corrLatency = 0, directDelay = 0, corrPad = 0;
+    bool isStudio = false, corrActive = false;
+};
+
 // ───────────────────────────── Mix bus ─────────────────────────────
 // Lead-vocal conditioning + reverb + limiter.
 class MixBus {
@@ -343,7 +461,9 @@ public:
         }
     }
     // Final mix: dry (centred) + harmonies (already in L/R) + reverb, then limiter.
-    void mix(const float *dry, float *L, float *R, int n, const Controls &c) {
+    // extraL/extraR (optional): backing track, summed after the reverb but before the limiter.
+    void mix(const float *dry, float *L, float *R, int n, const Controls &c,
+             const float *extraL = nullptr, const float *extraR = nullptr) {
         float dryLevel = clampf(c.dryLevel, 0, 1);
         float fxTarget = clampf(c.fx, 0, 1);
         float fxCoef = smoothCoef(0.08f, sampleRate);
@@ -356,6 +476,7 @@ public:
             reverb.process(send, wl, wr);
             float l = d + L[i] + wl * wet * kWetScale;
             float r = d + R[i] + wr * wet * kWetScale;
+            if (extraL) { l += extraL[i]; r += extraR[i]; }
             limiter.process(l, r);
             L[i] = l; R[i] = r;
         }

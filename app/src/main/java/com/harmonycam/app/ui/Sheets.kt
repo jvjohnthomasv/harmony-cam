@@ -23,6 +23,9 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.SaveAlt
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -63,7 +66,7 @@ import com.harmonycam.app.lyrics.Song
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsSheet(vm: StudioViewModel, onDismiss: () -> Unit) {
+fun SettingsSheet(vm: StudioViewModel, onPickTrack: () -> Unit, onDismiss: () -> Unit) {
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = state, containerColor = Color(0xFF12121B)) {
         val s = vm.settings
@@ -88,7 +91,6 @@ fun SettingsSheet(vm: StudioViewModel, onDismiss: () -> Unit) {
             LabeledSlider("Lead vocal level", s.leadLevel) { v -> set { it.copy(leadLevel = v) } }
             LabeledSlider("Natural feel (timing, drift, timbre)", s.humanize) { v -> set { it.copy(humanize = v) } }
             LabeledSlider("Harmony tuning (tight ↔ loose)", s.tightness, left = "loose", right = "tight") { v -> set { it.copy(tightness = v) } }
-            LabeledSlider("Reverb", s.reverb) { v -> set { it.copy(reverb = v) } }
             LabeledSlider("Stereo width", s.width) { v -> set { it.copy(width = v) } }
 
             Section("Hand gestures")
@@ -131,6 +133,17 @@ fun SettingsSheet(vm: StudioViewModel, onDismiss: () -> Unit) {
                         else -> ""
                     }
             )
+
+            Section("Karaoke backing track")
+            Text(s.trackName ?: "No track loaded", color = Hc.Text, fontSize = 14.sp)
+            Spacer(Modifier.height(6.dp))
+            OutlinedButton(onClick = { onPickTrack(); onDismiss() }) { Text(if (s.trackName == null) "Choose MP3 / audio file" else "Replace track") }
+            LabeledSlider("Track volume", s.trackLevel) { v -> set { it.copy(trackLevel = v) } }
+            LabeledSlider("Track sync nudge (${if (s.trackNudgeMs > 0) "+" else ""}${s.trackNudgeMs} ms)", (s.trackNudgeMs + 150) / 300f, left = "earlier", right = "later") { v ->
+                set { it.copy(trackNudgeMs = (Math.round(v * 300f) - 150) / 5 * 5) }
+            }
+            Toggle("Set the harmony key from the track", s.trackSetsKey) { v -> set { it.copy(trackSetsKey = v) } }
+            Hint("The track plays in your headphones while you sing and restarts with every take. Delay between headphones and mic is measured automatically; use the nudge only if the saved video sounds slightly early or late.")
 
             Section("Visual style")
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -299,5 +312,100 @@ private fun SongEditor(song: Song, onCancel: () -> Unit, onSave: (Song) -> Unit)
             ) { Text("Save & use") }
         }
         Spacer(Modifier.height(20.dp))
+    }
+}
+
+
+// ─────────────────────────────── Sound FX ───────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FxSheet(vm: StudioViewModel, onDismiss: () -> Unit) {
+    val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = state, containerColor = Color(0xFF12121B)) {
+        val s = vm.settings
+        val set: ((StudioSettings) -> StudioSettings) -> Unit = { vm.updateSettings(it) }
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).navigationBarsPadding()) {
+            Text("Sound FX", style = androidx.compose.material3.MaterialTheme.typography.titleLarge, color = Hc.Text)
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                    .background(if (s.effectsOff) Color(0x33FFC94A) else Color(0x14FFFFFF)).padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("All effects off", color = Hc.Text, fontWeight = FontWeight.SemiBold)
+                    Text("Plain recording: just your mic (and the karaoke track). No harmonies, tuning, reverb or compression.", color = Hc.TextDim, fontSize = 12.sp)
+                }
+                Switch(checked = s.effectsOff, onCheckedChange = { v -> set { it.copy(effectsOff = v) } })
+            }
+            val enabled = !s.effectsOff
+            Column(Modifier.fillMaxWidth().then(if (enabled) Modifier else Modifier.background(Color.Transparent))) {
+                Section("Harmonies")
+                Toggle("Harmonies on", s.harmoniesOn && enabled) { v -> if (enabled) set { it.copy(harmoniesOn = v) } }
+                LabeledSlider("Harmony level", s.harmonyLevel) { v -> set { it.copy(harmonyLevel = v) } }
+
+                Section("Pitch correction")
+                LabeledSlider("Amount", s.correction) { v -> set { it.copy(correction = v) } }
+                LabeledSlider("Style", 1f - s.retune, left = "natural", right = "hard / robotic") { v -> set { it.copy(retune = 1f - v) } }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Chip("Off", s.correction == 0f) { set { it.copy(correction = 0f) } }
+                    Chip("Subtle", s.correction in 0.01f..0.6f && s.retune >= 0.5f) { set { it.copy(correction = 0.5f, retune = 0.75f) } }
+                    Chip("Studio", s.correction > 0.6f && s.retune in 0.25f..0.5f) { set { it.copy(correction = 0.9f, retune = 0.4f) } }
+                    Chip("Robot", s.correction > 0.6f && s.retune < 0.1f) { set { it.copy(correction = 1f, retune = 0f) } }
+                }
+                Hint("Pulls your lead vocal onto the notes of the key (${Notes.key(s.keyRoot, s.minor)}). Natural keeps your vibrato; hard gives the classic auto-tune sound. Live monitoring adds about 20 ms while it's on.")
+
+                Section("Space & texture")
+                LabeledSlider("Reverb", s.reverb) { v -> set { it.copy(reverb = v) } }
+                LabeledSlider("Vocal doubler", s.doubler) { v -> set { it.copy(doubler = v) } }
+                LabeledSlider("Echo", s.echo) { v -> set { it.copy(echo = v) } }
+                Hint("Your left-hand pinch adds extra reverb on top of these while gestures are on.")
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+// ─────────────────────────────── Takes ───────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TakesSheet(vm: StudioViewModel, onPlay: (com.harmonycam.app.record.Take) -> Unit, onShare: (com.harmonycam.app.record.Take) -> Unit, onDismiss: () -> Unit) {
+    val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = state, containerColor = Color(0xFF12121B)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).navigationBarsPadding()) {
+            Text("Takes", style = androidx.compose.material3.MaterialTheme.typography.titleLarge, color = Hc.Text)
+            Text("Every take is kept here. Save the ones you like to the Gallery; delete the rest.", color = Hc.TextDim, fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+            if (vm.takes.isEmpty()) Text("No takes yet — hit record.", color = Hc.TextDim, modifier = Modifier.padding(vertical = 24.dp))
+            LazyColumn(Modifier.fillMaxWidth().height(460.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(vm.takes, key = { it.file.name }) { take ->
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0x14FFFFFF))
+                            .clickable { onPlay(take) }.padding(start = 14.dp, top = 8.dp, bottom = 8.dp, end = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Take ${take.number}", color = Hc.Text, fontWeight = FontWeight.SemiBold)
+                            val d = take.durationSec
+                            Text(
+                                "%d:%02d".format(d / 60, d % 60) + " · " +
+                                    java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(take.createdMs)) +
+                                    if (take.saved) " · in Gallery" else "",
+                                color = Hc.TextDim, fontSize = 12.sp
+                            )
+                        }
+                        IconButton(onClick = { onPlay(take) }) { Icon(androidx.compose.material.icons.Icons.Rounded.PlayArrow, "Play", tint = Hc.Text) }
+                        IconButton(onClick = { vm.saveTake(take) }, enabled = !take.saved) {
+                            Icon(androidx.compose.material.icons.Icons.Rounded.SaveAlt, "Save to Gallery", tint = if (take.saved) Hc.Ok else Hc.Text)
+                        }
+                        IconButton(onClick = { onShare(take) }) { Icon(androidx.compose.material.icons.Icons.Rounded.Share, "Share", tint = Hc.Text) }
+                        IconButton(onClick = { vm.deleteTake(take) }) { Icon(Icons.Rounded.Delete, "Delete", tint = Hc.TextDim) }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+        }
     }
 }

@@ -5,6 +5,7 @@
 
 #include "Harmonizer.h"
 #include "WavIO.h"
+#include "BackingTrack.h"
 
 #include <functional>
 
@@ -32,9 +33,11 @@ inline std::vector<Controls> loadAutomation(const std::string &path, int &hopSam
     return frames;
 }
 
+// trackOffset: vocal sample index at which backing-track sample 0 was heard by the singer.
 inline RenderResult renderPerformance(const std::string &dryWavPath, const std::string &automationPath,
                                       const std::string &outWavPath, const Controls &fallback,
-                                      const std::function<bool(float)> &progress) {
+                                      const std::function<bool(float)> &progress,
+                                      const std::string &trackPath = "", long trackOffset = 0, float trackGain = 0.7f) {
     RenderResult res;
     WavReader reader;
     if (!reader.open(dryWavPath)) { res.error = "cannot read vocal recording"; return res; }
@@ -44,6 +47,7 @@ inline RenderResult renderPerformance(const std::string &dryWavPath, const std::
 
     std::vector<float> dry(total);
     reader.readMono(dry.data(), total);
+    const std::vector<float> raw = dry; // untouched copy for "all effects off" sections
 
     int autoHop = 480;
     std::vector<Controls> automation = loadAutomation(automationPath, autoHop);
@@ -86,6 +90,9 @@ inline RenderResult renderPerformance(const std::string &dryWavPath, const std::
         return track[(size_t) idx];
     };
 
+    BackingTrack backing;
+    bool haveTrack = !trackPath.empty() && backing.load(trackPath, sr);
+
     // ── Pass 2: harmony voices + mix.
     VoiceBank bank;
     bank.setup((float) sr, VoiceBank::Studio);
@@ -93,12 +100,14 @@ inline RenderResult renderPerformance(const std::string &dryWavPath, const std::
     targetBrain.setup((float) sr);
     const int L = bank.latencySamples();
     const int inLat = bank.inputLatency();
+    LeadProcessor lead;
+    lead.setup((float) sr, true, L);
 
     WavWriter writer;
     if (!writer.open(outWavPath, sr, 2)) { res.error = "cannot write output"; return res; }
 
     const int block = 256;
-    std::vector<float> in(block), hl(block), hr(block), dryAligned(block), inter(block * 2);
+    std::vector<float> in(block), hl(block), hr(block), dryAligned(block), inter(block * 2), tl(block), tr(block), leadOut(block);
     DelayLine dryDelay;
     dryDelay.init(L + block + 8);
     const size_t totalOut = total + L;
@@ -113,10 +122,33 @@ inline RenderResult renderPerformance(const std::string &dryWavPath, const std::
         std::fill(hl.begin(), hl.end(), 0.0f);
         std::fill(hr.begin(), hr.end(), 0.0f);
         bank.process(in.data(), n, tg, c, ns.voiced ? ns.f0 : 0.0f, hl.data(), hr.data());
-        for (int i = 0; i < n; ++i) { dryDelay.write(in[i]); dryAligned[i] = dryDelay.read(L + 1); }
+        lead.process(in.data(), n, ns, c, leadOut.data(), hl.data(), hr.data());
+        // raw (unprocessed) vocal aligned to the output, for bypassed sections
+        for (int i = 0; i < n; ++i) {
+            dryDelay.write(t + i < total ? raw[t + i] : 0.0f);
+            dryAligned[i] = dryDelay.read(L + 1);
+        }
         // mix uses the controls of the audio actually being heard at this output position
         const Controls &cm = controlsAt((long) t - L);
-        bus.mix(dryAligned.data(), hl.data(), hr.data(), n, cm);
+        std::fill(tl.begin(), tl.end(), 0.0f);
+        std::fill(tr.begin(), tr.end(), 0.0f);
+        if (haveTrack) {
+            for (int i = 0; i < n; ++i) {
+                long vocalIndex = (long) (t + i) - L;
+                float a, b;
+                backing.sample(vocalIndex - trackOffset, a, b);
+                tl[i] = a * trackGain; tr[i] = b * trackGain;
+            }
+        }
+        if (cm.bypass > 0.5f) {
+            // plain recording: raw mic + backing track, nothing else
+            for (int i = 0; i < n; ++i) {
+                hl[i] = clampf(dryAligned[i] + tl[i], -1.0f, 1.0f);
+                hr[i] = clampf(dryAligned[i] + tr[i], -1.0f, 1.0f);
+            }
+        } else {
+            bus.mix(leadOut.data(), hl.data(), hr.data(), n, cm, tl.data(), tr.data());
+        }
 
         int skip = 0;
         if (t < (size_t) L) skip = (int) std::min<size_t>(n, L - t);
